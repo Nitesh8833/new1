@@ -1,3 +1,56 @@
+# dags/fetch_transform_to_gcs_dag.py
+import sys
+from datetime import datetime
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+# 1) Point sys.path to the folder that contains your .py script
+#    (Composer’s /dags is already on PYTHONPATH; because your folder names have hyphens
+#     you can’t import them as packages, so we append the inner directory)
+sys.path.append("/home/airflow/gcs/dags/pdi-ingestion-gcp/Dev/scripts/python_scripts")
+
+# 2) Import your function
+from fetch_transform_to_gcs import main as job_main
+
+# 3) GCS JSON config URI that your script needs
+GCS_CONFIG_URI = (
+    "gs://us-east4-cmp-dev-pdi-ink-05-5e6953c0-bucket/"
+    "dags/pdi-ingestion-gcp/Dev/config/db_config.json"
+)
+
+def run_wrapper(**context):
+    """
+    Wrapper that injects config and ensures failures fail the task.
+    Adjust to fit your script’s signature:
+      - If your main() expects kwargs, keep **context,
+      - If it expects a param (e.g., gcs_config_uri), pass it explicitly.
+    """
+    # If your module reads a global CONFIG_PATH, set it here:
+    try:
+        import fetch_transform_to_gcs as mod
+        mod.CONFIG_PATH = GCS_CONFIG_URI
+    except Exception:
+        # If your script expects a parameter instead, just call job_main(gcs_config_uri=...)
+        pass
+
+    # Now call your script’s entry point
+    # If main expects context, it will accept **context; otherwise remove it.
+    return job_main()
+
+with DAG(
+    dag_id="fetch_transform_to_gcs",
+    description="Fetch/Transform and write to GCS",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+) as dag:
+    run_job = PythonOperator(
+        task_id="run_fetch_transform",
+        python_callable=run_wrapper,
+        provide_context=True,   # harmless in A2; allows **context if your main uses it
+    )
+
+*******************************************************
 # fetch_transform_to_gcs.py
 #fetch_transform_to_gcs.py
 from __future__ import annotations
