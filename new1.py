@@ -1,4 +1,53 @@
 # dags/fetch_transform_to_gcs_dag.py
+from datetime import datetime
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from importlib.machinery import SourceFileLoader
+import logging
+
+# 1) ABSOLUTE PATH to your python file (fix the case exactly!)
+PY_FILE = (
+    "/home/airflow/gcs/dags/pdi-ingestion-gcp/Dev/scripts/python_scripts/"
+    "fetch_transform_to_gcs.py"
+)
+
+# 2) GCS JSON config (what your script needs to read)
+GCS_CONFIG_URI = (
+    "gs://us-east4-cmp-dev-pdi-ink-05-5e6953c0-bucket/"
+    "dags/pdi-ingestion-gcp/Dev/config/db_config.json"
+)
+
+def run_wrapper(**context):
+    # Load the module from file regardless of package names / hyphens
+    mod = SourceFileLoader("fetch_transform_to_gcs", PY_FILE).load_module()
+
+    # If your script uses a global CONFIG_PATH, set it here:
+    try:
+        mod.CONFIG_PATH = GCS_CONFIG_URI
+    except Exception:
+        pass
+
+    # Call the entry point. If your main() expects parameters, pass them here.
+    # Example if you changed your script to main(gcs_config_uri: str):
+    # return mod.main(gcs_config_uri=GCS_CONFIG_URI)
+    logging.info("Calling script main() …")
+    return mod.main()
+
+with DAG(
+    dag_id="fetch_transform_to_gcs",
+    description="Fetch/Transform and write to GCS",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+) as dag:
+    run_job = PythonOperator(
+        task_id="run_fetch_transform",
+        python_callable=run_wrapper,
+        provide_context=True,
+    )
+******
+
+# dags/fetch_transform_to_gcs_dag.py
 import sys
 from datetime import datetime
 from airflow import DAG
