@@ -1,3 +1,46 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+
+def gcs_smoke_test():
+    from google.cloud import storage
+    client = storage.Client(project="<YOUR_PROJECT_ID>")
+
+    bucket = client.bucket("<BUCKET>")
+    obj = "dags/pdi-ingestion-gcp/Dev/config/db_config.json"
+
+    # Test read
+    assert bucket.blob(obj).exists(client=client), f"Config object not found: {obj}"
+    print("✅ Can read config OK")
+
+    # Test write
+    out = bucket.blob("reports/_smoke_test.txt")
+    out.upload_from_string("hello from Composer")
+    print("✅ Can write to reports/ OK")
+
+
+with DAG(
+    dag_id="gcs_smoke_test_dag",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,  # only run manually
+    catchup=False,
+    tags=["debug"],
+) as dag:
+
+    test_task = PythonOperator(
+        task_id="gcs_smoke_test",
+        python_callable=gcs_smoke_test,
+    )
+*******************************************************
+
+
+
+
+
+
+
+
 from __future__ import annotations
 
 import io
