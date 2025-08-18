@@ -1,3 +1,9 @@
+import os
+logging.info("CWD=%s", os.getcwd())
+logging.info("Exists(pyfile)=%s", os.path.exists(PY_FILE))
+logging.info("Config URI=%s", GCS_CONFIG_URI)
+****************
+
 import logging, traceback
 from importlib.machinery import SourceFileLoader
 
