@@ -1,3 +1,51 @@
+import logging, traceback
+from importlib.machinery import SourceFileLoader
+
+PY_FILE = "/home/airflow/gcs/dags/pdi-ingestion-gcp/Dev/scripts/python_scripts/fetch_transform_to_gcs.py"
+GCS_CONFIG_URI = "gs://us-east4-cmp-dev-pdi-ink-05-5e6953c0-bucket/dags/pdi-ingestion-gcp/Dev/config/db_config.json"
+
+def run_wrapper(**context):
+    logging.info("Loading module from %s", PY_FILE)
+    mod = SourceFileLoader("fetch_transform_to_gcs", PY_FILE).load_module()
+
+    # if your module uses a global for the config path
+    try:
+        mod.CONFIG_PATH = GCS_CONFIG_URI
+        logging.info("CONFIG_PATH set to %s", mod.CONFIG_PATH)
+    except Exception:
+        pass
+
+    try:
+        logging.info("Calling main() …")
+        result = mod.main()  # or mod.main(gcs_config_uri=GCS_CONFIG_URI)
+        logging.info("main() returned: %r", result)
+        return result
+    except SystemExit as se:
+        # convert bare sys.exit() to a visible failure with traceback
+        logging.error("Caught SystemExit(%s). Converting to exception.", se.code)
+        logging.error("Traceback:\n%s", traceback.format_exc())
+        raise RuntimeError(f"Script called sys.exit({se.code}). See logs above.")
+    except Exception as e:
+        logging.error("Job failed: %s", e)
+        logging.error("Traceback:\n%s", traceback.format_exc())
+        raise
+****************************************
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime
+
+with DAG(
+    "fetch_transform_to_gcs",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+) as dag:
+    run_job = PythonOperator(
+        task_id="run_fetch_transform",
+        python_callable=run_wrapper,
+        do_xcom_push=True,   # lets you see the return value in XCom
+    )
+******************************************
 # dags/fetch_transform_to_gcs_dag.py
 from datetime import datetime
 from airflow import DAG
