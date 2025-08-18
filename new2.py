@@ -1,11 +1,12 @@
+# fetch_transform_to_gcs_dag.py
 from __future__ import annotations
-
 import io
 import json
 import logging
+import os
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 import pandas as pd
 import psycopg2
 from google.cloud import storage
@@ -13,8 +14,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
 
-# Embedded configuration (previously in db_config.json)
-CONFIG = {
+# Embedded configuration (replaces db_config.json)
+EMBEDDED_CONFIG = {
     "database": {
         "dbname": "pdigpgsd1_db",
         "user": "pdigpgsd1_nh_user",
@@ -35,12 +36,7 @@ CONFIG = {
     "output_gs_uri": "gs://usmedphcb-pdi-intake-devstg/reports/prvrostercnf_file_stats.xlsx"
 }
 
-# Default query and output settings
-DEFAULT_SQL = "SELECT * FROM pdipp.prvrostercnf_conformed_file_stats"
-DEFAULT_OUTPUT_FMT = "xlsx"
-DEFAULT_OUTPUT_SHEET = "Sheet1"
-
-# Column mapping
+# Column mapping configuration
 MAPPING: Dict[str, str] = {
     "business_owner": "Business Team",
     "group_type": "Group Team",
@@ -53,7 +49,12 @@ MAPPING: Dict[str, str] = {
     "error_details": "Error Description",
 }
 
-# DB connection
+# Default settings
+DEFAULT_SQL = "SELECT * FROM pdipp.prvrostercnf_conformed_file_stats"
+DEFAULT_OUTPUT_FMT = "xlsx"
+DEFAULT_OUTPUT_SHEET = "Sheet1"
+
+# Database connection
 def get_db_connection_with_gcs_certs(
     dbname: str,
     user: str,
@@ -74,7 +75,7 @@ def get_db_connection_with_gcs_certs(
     )
     return conn
 
-# Helpers
+# Helper functions
 def _normalize(s: str) -> str:
     return re.sub(r"[ \t\-\_\.]+", "", str(s).strip().lower())
 
@@ -117,7 +118,7 @@ def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
 
 def _next_available_name(client: storage.Client, bucket: str, object_name: str) -> str:
     bkt = client.bucket(bucket)
-    if not bkt.blob(object_name).exists(client=client):
+    if not bkt.blob(object_name).exists():
         return object_name
     if "/" in object_name:
         dir_, file_ = object_name.rsplit("/", 1)
@@ -132,7 +133,7 @@ def _next_available_name(client: storage.Client, bucket: str, object_name: str) 
     i = 1
     while True:
         candidate = f"{prefix}{stem}_{i:03d}{ext}"
-        if not bkt.blob(candidate).exists(client=client):
+        if not bkt.blob(candidate).exists():
             return candidate
         i += 1
 
@@ -189,6 +190,7 @@ def write_df_to_gcs(
     logging.info("[OUT] %s -> %s", fmt.upper(), out_uri)
     return out_uri
 
+# Core pipeline
 def run_pipeline_from_db(
     *,
     sql: str,
@@ -208,10 +210,6 @@ def run_pipeline_from_db(
         password=db_cfg["password"],
         host=db_cfg["host"],
         port=int(db_cfg.get("port", 5432)),
-        bucket_name=gcs_cfg.get("bucket_name"),
-        client_cert_gcs=gcs_cfg.get("client_cert"),
-        client_key_gcs=gcs_cfg.get("client_key"),
-        server_ca_gcs=gcs_cfg.get("server_ca"),
     )
     try:
         df_src = pd.read_sql_query(sql, con=conn)
@@ -232,6 +230,7 @@ def run_pipeline_from_db(
     )
     return df_out, written_uri
 
+# DAG entry point
 def main(**context):
     logging.basicConfig(
         level=logging.INFO,
@@ -239,12 +238,13 @@ def main(**context):
         force=True,
     )
 
-    cfg = CONFIG
+    cfg = EMBEDDED_CONFIG
     db_cfg = cfg["database"]
     gcs_cfg = cfg["gcs"]
 
     sql = cfg.get("sql_query", DEFAULT_SQL)
     out_gs_uri = cfg.get("output_gs_uri")
+    
     out_bucket = None
     out_object = None
     if not out_gs_uri:
@@ -269,15 +269,21 @@ def main(**context):
     logging.info("DONE. Rows written: %d -> %s", len(df_out), written_uri)
     return written_uri
 
-# Define the DAG
+# DAG definition
 with DAG(
     "fetch_transform_to_gcs",
     start_date=datetime(2025, 1, 1),
     schedule_interval=None,
     catchup=False,
+    tags=["data_pipeline"],
 ) as dag:
+    
     run_job = PythonOperator(
         task_id="run_fetch_transform",
         python_callable=main,
         provide_context=True,
     )
+
+# Local execution handler
+if __name__ == "__main__":
+    print(main())
