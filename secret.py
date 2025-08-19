@@ -1,3 +1,74 @@
+# dags/print_secret_from_sm_dag.py
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+
+# Google Secret Manager client
+from google.cloud import secretmanager
+
+# ---- Optional: read settings from Airflow Variables (with safe fallbacks) ----
+try:
+    from airflow.models import Variable
+    GET = lambda k, d=None: Variable.get(k, default_var=d)
+except Exception:  # when parsing locally or Variables not set
+    GET = lambda k, d=None: d
+
+# ---- Config (edit here or set as Airflow Variables with these keys) ----------
+PROJECT_ID      = GET("PROJECT_ID", "your-gcp-project-id")
+SECRET_NAME     = GET("SECRET_NAME", "poc-secret")        # e.g., a secret whose value is "gcp"
+SECRET_VERSION  = GET("SECRET_VERSION", "latest")
+
+# ---- Logging format ----------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+def print_secret_value(**context) -> str:
+    """
+    Fetch a secret from Secret Manager and print it.
+    If the secret's value is 'gcp', the logs will show 'gcp'.
+    """
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{PROJECT_ID}/secrets/{SECRET_NAME}/versions/{SECRET_VERSION}"
+        logging.info("Accessing Secret Manager: %s", name)
+
+        resp = client.access_secret_version(name=name)
+        secret_value = resp.payload.data.decode("utf-8")
+
+        # Print to task logs
+        print(secret_value)              # Airflow logs will show the value (e.g., gcp)
+        logging.info("Secret value printed successfully.")
+
+        # Also return via XCom if you want to reference it later
+        return secret_value
+
+    except Exception as e:
+        logging.error("Failed to read/print secret: %s", e, exc_info=True)
+        raise
+
+# ---- DAG definition ----------------------------------------------------------
+with DAG(
+    dag_id="print_secret_from_secret_manager",
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,   # run manually
+    catchup=False,
+    tags=["secretmanager", "example", "print"],
+) as dag:
+
+    print_secret = PythonOperator(
+        task_id="print_secret",
+        python_callable=print_secret_value,
+        provide_context=True,
+    )
+
+********************************
+
 # dags/cloudsql_postgres_query_dag.py
 
 from __future__ import annotations
