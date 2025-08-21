@@ -1,5 +1,152 @@
+from __future__ import annotations
+import os
+from datetime import datetime
+import json
+import pendulum
+from google.cloud import storage
 
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.utils.state import State
+from airflow.providers.google.cloud.operators.dataproc import (
+    DataprocCreateClusterOperator,
+    DataprocSubmitJobOperator,
+    DataprocDeleteClusterOperator,
+)
 
+# -------------------- Load config from GCS --------------------
+def load_config_from_gcs(bucket_name: str, blob_name: str) -> dict:
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(blob_name)
+    return json.loads(blob.download_as_text())
+
+cfg_all = load_config_from_gcs("edp-dev-hcbstorage", "config/conformance_load_config.json")
+
+# Split out pipeline config vs. cluster config
+cfg            = cfg_all["config"]                 # your pipeline settings
+cluster_block  = cfg_all["cluster_config"]         # has project_id, cluster_name, config
+CLUSTER_CONFIG = cluster_block["config"]           # <-- ONLY inner 'config' goes to operator
+GCE_CLUSTER_NAME = cluster_block["cluster_name"]
+# Prefer top-level region if present, else inner config value
+REGION = cfg_all.get("region", cfg["REGION"])
+
+# -------------------- Convenience getters --------------------
+PROJECT_ID = os.environ.get("GCP_PROJECT") or cfg["PROJECT_ID"]
+OWNER_NAME = cfg.get("OWNER_NAME", "owner")        # optional in your JSON
+DAG_TAGS   = cfg["DAG_TAGS"]                       # list
+DAG_ID     = cfg["DAG_ID_PREFIX"]
+CONNECT_SA = cfg["CONNECT_SA"]
+
+# -------------------- Helpers --------------------
+def get_curr_date(date_format_for: str) -> str:
+    dt_now = pendulum.now("America/New_York")
+    if date_format_for == "file":
+        return dt_now.format("MMDDYYYY_HHmmss")
+    return dt_now.format("YYYYMMDDHHmm")
+
+def final_status(**kwargs):
+    """Fail the DAG if any upstream task failed."""
+    for ti in kwargs['dag_run'].get_task_instances():
+        if ti.task_id != kwargs['task_instance'].task_id and ti.current_state() != State.SUCCESS:
+            raise Exception(f"Task {ti.task_id} failed. Failing this DAG run")
+
+default_args = {"project_id": PROJECT_ID, "retries": 0}
+
+# -------------------- PySpark job --------------------
+PYSPARK_JOB_DEA = {
+    "reference": {"project_id": PROJECT_ID},
+    "placement": {"cluster_name": GCE_CLUSTER_NAME},
+    "pyspark_job": {
+        "main_python_file_uri": f"{cfg['PYTHON_FILE_URIS']}",
+        "args": [
+            "--ENV",               f"{cfg['ENVIRONMENT']}",
+            "--LOGIN_URL",         f"{cfg['DEA_LOGIN_URL']}",
+            "--LGN_EMAIL",         f"{cfg['DEA_LGN_ID']}",
+            "--LGN_PD",            f"{cfg['DEA_LGN_PD']}",
+            "--GCS_BUCKET",        f"{cfg['STG_STORAGE_BUCKET']}",
+            "--GCS_BLOB_NAME",     f"{cfg['DEA_BLOB_NAME']}",
+            "--DEA_DB_INSTANCE",   f"{cfg['DEA_DB_INSTANCE']}",
+            "--DEA_DB_USER",       f"{cfg['DEA_DB_USER']}",
+            "--DEA_DB_PD",         f"{cfg['DEA_DB_PWD']}",
+            "--DEA_DB_NAME",       f"{cfg['DEA_DB_NAME']}",
+            "--DEA_TBL_NAME",      f"{cfg['DEA_TBL_NAME']}",
+            "--DEA_BKP_TBL_NAME",  f"{cfg['DEA_BKP_TBL_NAME']}",
+            "--DEA_STG_TBL_NAME",  f"{cfg['DEA_STG_TBL_NAME']}",
+            "--STORAGE_PROJECT_ID",f"{cfg['STORAGE_PROJECT_ID']}",
+            "--STG_STORAGE_BUCKET",f"{cfg['STG_STORAGE_BUCKET']}",
+            "--BQ_PROJECT_ID",     f"{cfg['BQ_PROJECT_ID']}",
+            "--BQ_PDI_DS",         f"{cfg['BQ_PDI_DS']}",
+            "--BQ_TBL_NAME",       f"{cfg['BQ_TBL_NAME']}",
+            "--FROM_EMAIL",        f"{cfg['FROM_EMAIL']}",
+            "--TO_EMAIL",          f"{cfg['TO_EMAIL']}",
+            "--TO_DEAEXPEMAIL",    f"{cfg['TO_DEAEXPEMAIL']}",
+            "--SMTP_SERVER",       f"{cfg['SMTP_SERVER']}",
+        ],
+        # If you need jars, add as a sibling key (not inside args):
+        # "jar_file_uris": [
+        #     f"{cfg['JAR_FILE_URIS_PATH']}/spark-bigquery-with-dependencies_2.12-0.33.2.jar"
+        # ]
+    },
+}
+
+# -------------------- DAG & tasks --------------------
+dag = DAG(
+    DAG_ID,
+    description="Creates conformance report, extract and loads into GCP bucket",
+    default_args=default_args,
+    schedule_interval=None,
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=DAG_TAGS,  # use list directly
+    params={
+        "file_date":   get_curr_date('file'),
+        "folder_date": get_curr_date('folder'),
+        "delete_src_flag": "no",
+    },
+)
+
+create_cluster = DataprocCreateClusterOperator(
+    task_id="create_cluster",
+    project_id=PROJECT_ID,            # separate operator args
+    region=REGION,
+    cluster_name=GCE_CLUSTER_NAME,
+    cluster_config=CLUSTER_CONFIG,    # ONLY inner config
+    delete_on_error=True,
+    use_if_exists=True,
+    impersonation_chain=CONNECT_SA,
+    dag=dag,
+)
+
+dea_refresh_gcp = DataprocSubmitJobOperator(
+    task_id="extract_dea_and_refresh_gcp",
+    job=PYSPARK_JOB_DEA,
+    project_id=PROJECT_ID,
+    region=REGION,
+    impersonation_chain=CONNECT_SA,
+    dag=dag,
+)
+
+delete_cluster = DataprocDeleteClusterOperator(
+    task_id="delete_cluster",
+    project_id=PROJECT_ID,
+    region=REGION,
+    cluster_name=GCE_CLUSTER_NAME,
+    impersonation_chain=CONNECT_SA,
+    trigger_rule=TriggerRule.ALL_DONE,
+    dag=dag,
+)
+
+final_status_task = PythonOperator(
+    task_id="final_status",
+    python_callable=final_status,
+    trigger_rule=TriggerRule.ALL_DONE,
+    dag=dag,
+)
+
+create_cluster >> dea_refresh_gcp >> delete_cluster >> final_status_task
+
+*******************************************************************************************
 {
   "SMTP_SERVER": "smtp.gmail.com",
   "cluster_config": {
