@@ -1,3 +1,68 @@
+********************************************************
+{
+    "config": {
+        "PROJECT_ID": "edp-dev-hcbstorage",
+        "DAG_TAGS": ["dea", "data_pipeline"],
+        "DAG_ID_PREFIX": "dea_u1deav02",
+        "CLUSTER_NAME": "dea-cluster",
+        "REGION": "us-central1",
+        "CONNECT_SA": "service-account@edp-dev-hcbstorage.iam.gserviceaccount.com",
+        "PYTHON_FILE_URIS": "gs://your-bucket/pyspark",
+        "JAR_FILE_URIS_PATH": "gs://your-bucket/jars",
+        "ENVIRONMENT": "dev",
+        "DEA_LOGIN_URL": "https://example.com/login",
+        "DEA_LGN_ID": "user@example.com",
+        "DEA_LGN_PD": "password",
+        "STG_STORAGE_BUCKET": "edp-dev-hcbstorage",
+        "DEA_BLOB_NAME": "reports/prvrostercnf_file_stats_{}.xlsx",
+        "DEA_DB_INSTANCE": "dea-instance",
+        "DEA_DB_USER": "dea_user",
+        "DEA_DB_PWD": "dea_password",
+        "DEA_DB_NAME": "dea_db",
+        "DEA_TBL_NAME": "dea_table",
+        "DEA_BKP_TBL_NAME": "dea_backup",
+        "DEA_STG_TBL_NAME": "dea_staging",
+        "STORAGE_PROJECT_ID": "edp-dev-hcbstorage",
+        "BQ_PROJECT_ID": "edp-dev-hcbstorage",
+        "BQ_PDI_DS": "dea_dataset",
+        "BQ_TBL_NAME": "dea_bq_table",
+        "FROM_EMAIL": "sender@example.com",
+        "TO_EMAIL": "recipient@example.com",
+        "TO_DEAEXPEMAIL": "error_recipient@example.com",
+        "SMTP_SERVER": "smtp.example.com"
+    },
+    "cluster_config": {
+        "project_id": "edp-dev-hcbstorage",
+        "cluster_name": "dea-cluster",
+        "config": {
+            "gce_cluster_config": {
+                "zone_uri": "us-central1-a",
+                "service_account": "service-account@edp-dev-hcbstorage.iam.gserviceaccount.com",
+                "tags": ["dea", "data_pipeline"]
+            },
+            "master_config": {
+                "num_instances": 1,
+                "machine_type_uri": "n2-standard-4",
+                "disk_config": {"boot_disk_type": "pd-balanced", "boot_disk_size_gb": 100}
+            },
+            "worker_config": {
+                "num_instances": 2,
+                "machine_type_uri": "n2-standard-4",
+                "disk_config": {"boot_disk_type": "pd-balanced", "boot_disk_size_gb": 100}
+            },
+            "software_config": {
+                "image_version": "2.2-debian12",
+                "properties": {}
+            },
+            "endpoint_config": {"enable_http_port_access": true},
+            "lifecycle_config": {
+                "idle_delete_ttl": {"seconds": 1800}
+            }
+        },
+        "region": "us-central1"
+    }
+}
+***************************************************
 from __future__ import annotations
 import os
 import sys
