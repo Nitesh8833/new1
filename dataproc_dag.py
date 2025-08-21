@@ -1,3 +1,51 @@
+
+
+{
+  "SMTP_SERVER": "smtp.gmail.com",
+  "cluster_config": {
+    "project_id": "edp-dev-hcbstorage",
+    "cluster_name": "dea-cluster",
+    "config": {
+      "gce_cluster_config": {
+        "zone_uri": "us-east4-c",
+        "service_account": "dea-service-account@edp-dev-hcbstorage.iam.gserviceaccount.com",
+        "tags": ["dea", "data_pipeline"]
+      },
+      "master_config": {
+        "num_instances": 1,
+        "machine_type_uri": "n2-standard-4",
+        "disk_config": {
+          "boot_disk_type": "pd-balanced",
+          "boot_disk_size_gb": 10
+        }
+      },
+      "worker_config": {
+        "num_instances": 2,
+        "machine_type_uri": "n2-standard-4",
+        "disk_config": {
+          "boot_disk_type": "pd-balanced",
+          "boot_disk_size_gb": 10
+        }
+      },
+      "software_config": {
+        "image_version": "2.2-debian12",
+        "properties": {
+          "spark:spark.executor.memory": "10g"
+        }
+      },
+      "endpoint_config": {
+        "enable_http_port_access": true
+      },
+      "lifecycle_config": {
+        "idle_delete_ttl": {
+          "seconds": 1800
+        }
+      }
+    }
+  },
+  "region": "us-east4"
+}
+************************************************************8
 from __future__ import annotations
 import os
 import sys
