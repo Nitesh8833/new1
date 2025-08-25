@@ -1,4 +1,155 @@
-# at top of file:
+from __future__ import annotations
+
+import logging
+import os
+import smtplib
+from pathlib import Path
+from typing import Iterable, Optional, Tuple, Union
+
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# =============== CONFIG (edit as needed) ===============
+EMAIL_SENDER: str = os.getenv("EMAIL_SENDER", "noreply@example.com")
+EMAIL_TO: list[str] = ["you@example.com"]  # str or list[str] both ok
+EMAIL_SUBJECT: str = "Roster Report Ready"
+EMAIL_TEXT: str = "Hello,\n\nPlease find the latest report attached.\n\nRegards,\nNitesh"
+
+SMTP_SERVER: str = os.getenv("SMTP_SERVER", "smtp.example.com")
+SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))  # 25 or 587
+USE_TLS: bool = True                                  # True for 587, False for 25
+SMTP_USERNAME: Optional[str] = os.getenv("SMTP_USERNAME")  # set if your server needs auth
+SMTP_PASSWORD: Optional[str] = os.getenv("SMTP_PASSWORD")
+
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+# =======================================================
+
+# Types accepted in `attachments`
+Pathish = Union[str, Path]
+MemAttach = Tuple[Union[bytes, bytearray], str, str]  # (data, "name.ext", "mime/type")
+PathAttach1 = Tuple[Pathish]                          # (path,)
+PathAttach2 = Tuple[Pathish, str]                     # (path, "alias.ext")
+Attachment = Union[Pathish, MemAttach, PathAttach1, PathAttach2]
+
+
+def send_email_alert(
+    recipient: Union[str, Iterable[str]],
+    subject: str,
+    message_body: str,
+    html_content: Optional[str] = None,
+    attachments: Optional[Iterable[Attachment]] = None,
+    smtp_server: str = SMTP_SERVER,
+    smtp_port: int = SMTP_PORT,
+    sender: str = EMAIL_SENDER,
+    use_tls: bool = USE_TLS,
+    username: Optional[str] = SMTP_USERNAME,
+    password: Optional[str] = SMTP_PASSWORD,
+) -> bool:
+    """
+    Send an email with plain text + optional HTML and attachments.
+
+    Attachments accepted:
+      - "path/to/file" or Path(...)
+      - (path,) or (path, "alias.ext")
+      - (bytes_or_bytearray, "name.ext", "mime/type")
+    """
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+    # Normalize recipients
+    if isinstance(recipient, (list, tuple, set)):
+        recipients = list(recipient)
+        to_header = ", ".join(recipients)
+    else:
+        recipients = [str(recipient)]
+        to_header = recipients[0]
+
+    # Build message
+    msg = MIMEMultipart("alternative")
+    msg["From"] = sender
+    msg["To"] = to_header
+    msg["Subject"] = subject
+
+    # Plain + optional HTML
+    msg.attach(MIMEText(message_body, "plain"))
+    if html_content:
+        msg.attach(MIMEText(html_content, "html"))
+
+    # -------- Attachments (paths, tuples, or in-memory bytes) --------
+    if attachments:
+        for item in attachments:
+            # In-memory: (bytes, "name.ext", "mime/type")
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) >= 2
+                and isinstance(item[0], (bytes, bytearray))
+            ):
+                data: Union[bytes, bytearray] = item[0]
+                name: str = str(item[1])
+                mime: str = str(item[2]) if len(item) >= 3 else "application/octet-stream"
+                if "/" in mime:
+                    maintype, subtype = mime.split("/", 1)
+                else:
+                    maintype, subtype = "application", "octet-stream"
+
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(data)
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f'attachment; filename="{name}"')
+                msg.attach(part)
+                continue
+
+            # Path-like: "path", Path(...), (path,), (path, "alias")
+            filename_override: Optional[str] = None
+            if isinstance(item, (tuple, list)):
+                if not item:
+                    continue
+                file_path = item[0]
+                if len(item) > 1:
+                    filename_override = str(item[1])
+            else:
+                file_path = item
+
+            try:
+                p = Path(os.fspath(file_path))
+            except TypeError:
+                logging.warning("Skipping attachment with invalid type: %r", item)
+                continue
+
+            if not p.exists():
+                logging.warning("Attachment not found, skipping: %s", p)
+                continue
+
+            with p.open("rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            filename = filename_override or p.name
+            part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+            msg.attach(part)
+    # ------------------------------------------------------------------
+
+    # Send
+    try:
+        logging.info("Connecting SMTP %s:%s (TLS=%s)", smtp_server, smtp_port, use_tls)
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
+            if use_tls:
+                server.starttls()
+            if username and password:
+                server.login(username, password)
+            logging.info("Sending email to: %s", to_header)
+            server.send_message(msg)
+        logging.info("Email sent.")
+        return True
+    except Exception as e:
+        logging.error("Email send failed: %s", e)
+        return False
+
+*********************************************# at top of file:
 import os
 from email.mime.application import MIMEApplication
 
