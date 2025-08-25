@@ -1,3 +1,50 @@
+import io
+
+if SEND_EMAIL:
+    csv_bytes = out_df.to_csv(index=False).encode("utf-8-sig")
+    text = (
+        EMAIL_TEXT
+        + f"\n\nRows: {len(out_df)} | Columns: {len(out_df.columns)}"
+    )
+    html = out_df.to_html(index=False)
+
+    send_email_alert(
+        recipient=EMAIL_TO,
+        subject=EMAIL_SUBJECT,
+        message_body=text,
+        html_content=html,  # shows the DF as a table in the email body
+        attachments=[("roster_report.csv", csv_bytes, "text/csv")],  # in-memory
+    )
+
+*******************
+import io
+import pandas as pd
+
+if SEND_EMAIL:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="Report")
+    buf.seek(0)
+
+    xlsx_bytes = buf.getvalue()
+    text = (
+        EMAIL_TEXT
+        + f"\n\nRows: {len(out_df)} | Columns: {len(out_df.columns)}"
+    )
+    html = out_df.to_html(index=False)
+
+    send_email_alert(
+        recipient=EMAIL_TO,
+        subject=EMAIL_SUBJECT,
+        message_body=text,
+        html_content=html,  # also show the table inline
+        attachments=[(
+            "roster_report.xlsx",
+            xlsx_bytes,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )],
+    )
+
 # ----- Secret names in Secret Manager (no project prefix needed) -----
 SECRET_DB_USER     = "pdi_prvrstrcnf_cloud_sql_user"
 SECRET_DB_PASSWORD = "pdi_prvrstrcnf_cloud_sql_password"
