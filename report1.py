@@ -1,3 +1,77 @@
+# ---------------- Attachments (paths, DataFrames, bytes) ----------------
+if attachments:
+    for item in attachments:
+        data: bytes
+        filename: str
+        mime: str | None = None
+
+        # CASE A: user passed a tuple/list like (obj, "name.ext", "mime/type"?)
+        if isinstance(item, (tuple, list)):
+            if not item:
+                continue
+            obj = item[0]
+            filename = str(item[1]) if len(item) > 1 else "attachment.bin"
+            mime = str(item[2]) if len(item) > 2 else None
+
+            # DataFrame -> bytes
+            if pd is not None and isinstance(obj, pd.DataFrame):
+                if filename.lower().endswith(".xlsx"):
+                    buf = io.BytesIO()
+                    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+                        obj.to_excel(w, index=False, sheet_name="Sheet1")
+                    data = buf.getvalue()
+                    mime = mime or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                else:
+                    # default to CSV
+                    data = obj.to_csv(index=False).encode("utf-8")
+                    mime = mime or "text/csv"
+
+            # file-like (BytesIO or anything with .read())
+            elif hasattr(obj, "read"):
+                data = obj.read()
+                if isinstance(data, str):
+                    data = data.encode("utf-8")
+                mime = mime or "application/octet-stream"
+
+            # bytes / bytearray
+            elif isinstance(obj, (bytes, bytearray)):
+                data = bytes(obj)
+                mime = mime or "application/octet-stream"
+
+            # fallback: treat as a path
+            else:
+                p = Path(os.fspath(obj))
+                if not p.exists():
+                    logging.warning("Attachment not found, skipping: %s", p)
+                    continue
+                with p.open("rb") as f:
+                    data = f.read()
+                if not filename or filename == "attachment.bin":
+                    filename = p.name
+                mime = mime or "application/octet-stream"
+
+        # CASE B: simple path (str/Path)
+        else:
+            p = Path(os.fspath(item))
+            if not p.exists():
+                logging.warning("Attachment not found, skipping: %s", p)
+                continue
+            with p.open("rb") as f:
+                data = f.read()
+            filename = p.name
+            mime = "application/octet-stream"
+
+        # attach
+        m = mime or "application/octet-stream"
+        main, sub = m.split("/", 1)
+        part = MIMEBase(main, sub)
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(part)
+# -----------------------------------------------------------------------
+
+********************************
 import io
 
 if SEND_EMAIL:
