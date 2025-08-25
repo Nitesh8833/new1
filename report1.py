@@ -1,3 +1,187 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os, json, logging
+from datetime import datetime
+import pendulum
+from google.cloud import storage
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.utils.state import State
+from airflow.providers.google.cloud.operators.dataproc import (
+    DataprocCreateClusterOperator,
+    DataprocSubmitJobOperator,
+    DataprocDeleteClusterOperator,
+)
+
+logging.basicConfig(level=logging.INFO)
+
+# ------------------------ Load config from GCS ------------------------ #
+def load_config_from_gcs(bucket_name: str, blob_name: str) -> dict:
+    client = storage.Client()
+    blob = client.bucket(bucket_name).blob(blob_name)
+    return json.loads(blob.download_as_text())
+
+CFG_BUCKET = "us-east4-cmp-dev-pdi-ink-05-5e6953c0-bucket"
+CFG_BLOB   = "dags/pdi-ingestion-gcp/Dev/config/db_config.json"
+
+cfg_all = load_config_from_gcs(CFG_BUCKET, CFG_BLOB)
+cfg             = cfg_all["config"]
+cluster_block   = cfg_all["cluster_config"]
+CLUSTER_CONFIG  = cluster_block["config"]
+BASE_CLUSTER_NAME = cluster_block["cluster_name"]
+REGION = cfg_all.get("region", cfg["REGION"])
+
+# ---------------------------- Convenience ---------------------------- #
+PROJECT_ID = os.environ.get("GCP_PROJECT") or cfg["PROJECT_ID"]
+DAG_TAGS   = cfg.get("DAG_TAGS", [])
+CONNECT_SA = cfg["CONNECT_SA"]
+
+TZ_NAME = cfg.get("DAG_TZ", "Asia/Kolkata")
+TZ = pendulum.timezone(TZ_NAME)
+
+def final_status(**kwargs):
+    for ti in kwargs["dag_run"].get_task_instances():
+        if ti.task_id != kwargs["task_instance"].task_id and ti.current_state() != State.SUCCESS:
+            raise Exception(f"Task {ti.task_id} failed. Failing this DAG run")
+
+def build_pyspark_job(main_py_uri: str) -> dict:
+    return {
+        "reference": {"project_id": PROJECT_ID},
+        # NOTE: cluster_name is set per-DAG right before submission
+        "pyspark_job": {
+            "main_python_file_uri": main_py_uri,
+            "args": [
+                "--ENV",               f"{cfg['ENVIRONMENT']}",
+                "--LOGIN_URL",         f"{cfg['DEA_LOGIN_URL']}",
+                "--LGN_EMAIL",         f"{cfg['DEA_LGN_ID']}",
+                "--LGN_PD",            f"{cfg['DEA_LGN_PD']}",
+                "--GCS_BUCKET",        f"{cfg['STG_STORAGE_BUCKET']}",
+                "--GCS_BLOB_NAME",     f"{cfg['DEA_BLOB_NAME']}",
+                "--DB_INSTANCE",       f"{cfg['DEA_DB_INSTANCE']}",
+                "--DB_USER",           f"{cfg['DEA_DB_USER']}",
+                "--DB_PD",             f"{cfg['DEA_DB_PWD']}",
+                "--DEA_DB_NAME",       f"{cfg['DEA_DB_NAME']}",
+                "--TBL_NAME",          f"{cfg['DEA_TBL_NAME']}",
+                "--DEA_BKP_TBL_NAME",  f"{cfg['DEA_BKP_TBL_NAME']}",
+                "--DEA_STG_TBL_NAME",  f"{cfg['DEA_STG_TBL_NAME']}",
+                "--STORAGE_PROJECT_ID", f"{cfg['STORAGE_PROJECT_ID']}",
+                "--STG_STORAGE_BUCKET", f"{cfg['STG_STORAGE_BUCKET']}",
+                "--BQ_PROJECT_ID",     f"{cfg['BQ_PROJECT_ID']}",
+                "--BQ_PDI_DS",         f"{cfg['BQ_PDI_DS']}",
+                "--BQ_TBL_NAME",       f"{cfg['BQ_TBL_NAME']}",
+                "--FROM_EMAIL",        f"{cfg['FROM_EMAIL']}",
+                "--TO_EMAIL",          f"{cfg['TO_EMAIL']}",
+                "--TO_DEAEXPEMAIL",    f"{cfg['TO_DEAEXPEMAIL']}",
+                "--SMTP_SERVER",       f"{cfg['SMTP_SERVER']}",
+            ],
+        },
+    }
+
+def make_dataproc_dag(*, dag_id: str, schedule: str, main_py_uri: str, cluster_suffix: str):
+    default_args = {"project_id": PROJECT_ID, "retries": 0}
+    start = pendulum.datetime(2025, 1, 1, 0, 0, tz=TZ)
+
+    dag = DAG(
+        dag_id,
+        description=f"{dag_id} — Dataproc PySpark job",
+        default_args=default_args,
+        schedule=schedule,          # if on older Airflow, use schedule_interval=schedule
+        start_date=start,
+        catchup=False,
+        tags=DAG_TAGS,
+        timezone=TZ,                # ensures cron runs at 08:00 in TZ_NAME
+    )
+
+    cluster_name = f"{BASE_CLUSTER_NAME}-{cluster_suffix}"
+
+    # Build job and add placement with this DAG's cluster name
+    job = build_pyspark_job(main_py_uri)
+    job["placement"] = {"cluster_name": cluster_name}
+
+    create_cluster = DataprocCreateClusterOperator(
+        task_id="create_cluster",
+        project_id=PROJECT_ID,
+        region=REGION,
+        cluster_name=cluster_name,
+        cluster_config=CLUSTER_CONFIG,
+        delete_on_error=True,
+        use_if_exists=False,
+        impersonation_chain=CONNECT_SA,
+        dag=dag,
+    )
+
+    submit = DataprocSubmitJobOperator(
+        task_id="run_pyspark",
+        job=job,
+        project_id=PROJECT_ID,
+        region=REGION,
+        impersonation_chain=CONNECT_SA,
+        dag=dag,
+    )
+
+    delete_cluster = DataprocDeleteClusterOperator(
+        task_id="delete_cluster",
+        project_id=PROJECT_ID,
+        region=REGION,
+        cluster_name=cluster_name,
+        impersonation_chain=CONNECT_SA,
+        trigger_rule=TriggerRule.ALL_DONE,
+        dag=dag,
+    )
+
+    final_status_task = PythonOperator(
+        task_id="final_status",
+        python_callable=final_status,
+        trigger_rule=TriggerRule.ALL_DONE,
+        dag=dag,
+    )
+
+    create_cluster >> submit >> delete_cluster >> final_status_task
+    return dag
+
+# -------------------------- Three DAGs w/ schedules -------------------------- #
+# Use explicit keys for the three scripts
+DAILY_MAIN   = cfg["PY_FILE_DAILY"]
+WEEKLY_MAIN  = cfg["PY_FILE_WEEKLY"]
+MONTHLY_MAIN = cfg["PY_FILE_MONTHLY"]
+
+daily_schedule   = "0 8 * * *"   # daily 08:00
+weekly_schedule  = "0 8 * * 1"   # Mondays 08:00
+monthly_schedule = "0 8 1 * *"   # 1st of month 08:00
+
+DAG_ID_PREFIX = cfg["DAG_ID_PREFIX"]
+
+daily_dag   = make_dataproc_dag(
+    dag_id=f"{DAG_ID_PREFIX}_daily",
+    schedule=daily_schedule,
+    main_py_uri=DAILY_MAIN,
+    cluster_suffix="daily",
+)
+
+weekly_dag  = make_dataproc_dag(
+    dag_id=f"{DAG_ID_PREFIX}_weekly",
+    schedule=weekly_schedule,
+    main_py_uri=WEEKLY_MAIN,
+    cluster_suffix="weekly",
+)
+
+monthly_dag = make_dataproc_dag(
+    dag_id=f"{DAG_ID_PREFIX}_monthly",
+    schedule=monthly_schedule,
+    main_py_uri=MONTHLY_MAIN,
+    cluster_suffix="monthly",
+)
+
+globals().update({
+    daily_dag.dag_id: daily_dag,
+    weekly_dag.dag_id: weekly_dag,
+    monthly_dag.dag_id: monthly_dag,
+})
+
+*******************************************
 from __future__ import annotations
 
 import logging
