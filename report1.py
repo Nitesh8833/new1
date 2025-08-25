@@ -1,3 +1,61 @@
+# at top of file:
+import os
+from email.mime.application import MIMEApplication
+
+# ... inside send_email_alert(), REPLACE your attachments loop with this:
+# ----------------------------------------------------------------------
+# Attachments: supports
+#  - "path/to/file"
+#  - (path,) or (path, "alias.ext")
+#  - (bytes_or_bytearray, "name.ext", "mime/type")
+if attachments:
+    for item in attachments:
+        filename_override = None
+
+        # (bytes, "name", "mime/type") → in-memory attach
+        if isinstance(item, (tuple, list)) and len(item) >= 2 and isinstance(item[0], (bytes, bytearray)):
+            data = item[0]
+            name = str(item[1])
+            mime = str(item[2]) if len(item) >= 3 else "application/octet-stream"
+            maintype, subtype = mime.split("/", 1) if "/" in mime else ("application", "octet-stream")
+
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(data)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{name}"')
+            msg.attach(part)
+            continue
+
+        # (path,) or (path, "alias.ext")
+        if isinstance(item, (tuple, list)):
+            if not item:
+                continue
+            file_path = item[0]
+            if len(item) > 1:
+                filename_override = str(item[1])
+        else:
+            file_path = item
+
+        # normalize to Path for filesystem attachment
+        try:
+            p = Path(os.fspath(file_path))
+        except TypeError:
+            logging.warning("Skipping attachment with invalid type: %r", item)
+            continue
+
+        if not p.exists():
+            logging.warning("Attachment not found, skipping: %s", p)
+            continue
+
+        with p.open("rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        filename = filename_override or p.name
+        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(part)
+# ----------------------------------------------------------------------
+
 # ---------------- Attachments (paths, DataFrames, bytes) ----------------
 if attachments:
     for item in attachments:
