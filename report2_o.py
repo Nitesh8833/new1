@@ -1,3 +1,63 @@
+import pandas as pd
+
+def add_changed_roster_formats_count_desc(
+    df: pd.DataFrame,
+    owner_col: str | None = None,
+    status_col: str = "header_version_status",
+    version_col: str = "header_version_number",
+    ts_col: str = "insert_timestamp",
+    out_col: str = "# Changed Roster Formats (Count)",
+) -> pd.DataFrame:
+    """
+    Count *all* transitions per business owner where:
+      - Current row has header_version_status = NEW
+      - Current row has header_version_number = 1
+      - Immediately previous row (in descending timestamp order) is EXISTING
+    """
+
+    out = df.copy()
+
+    # Find business_owner column if not specified
+    if owner_col is None:
+        for cand in ["business_owner", "Business Team", "owner", "Owner"]:
+            if cand in out.columns:
+                owner_col = cand
+                break
+
+    if owner_col is None or any(c not in out.columns for c in [owner_col, status_col, version_col, ts_col]):
+        out[out_col] = 0
+        return out
+
+    # Normalize timestamp + status
+    out[ts_col] = pd.to_datetime(out[ts_col], errors="coerce")
+    out["_status_norm"] = out[status_col].astype(str).str.strip().str.upper()
+    out["_version_num"] = pd.to_numeric(out[version_col], errors="coerce")
+
+    # Sort within owner DESCENDING
+    out = out.sort_values([owner_col, ts_col], ascending=[True, False], kind="mergesort")
+
+    # Previous row in descending order → shift(-1)
+    out["_prev_status"] = out.groupby(owner_col)["_status_norm"].shift(-1)
+
+    # Detect changes
+    change_mask = (
+        (out["_status_norm"] == "NEW") &
+        (out["_version_num"] == 1) &
+        (out["_prev_status"] == "EXISTING")
+    )
+
+    # Count per owner
+    per_owner_counts = change_mask.groupby(out[owner_col]).sum().astype(int)
+
+    # Map results back
+    out[out_col] = out[owner_col].map(per_owner_counts).fillna(0).astype(int)
+
+    # Clean helpers
+    out.drop(columns=["_status_norm", "_version_num", "_prev_status"], inplace=True)
+
+    return out
+
+***********************************************************
 from __future__ import annotations
 import io, re, json, os
 from typing import Optional, Dict, List, Any, Iterable, Tuple, Union
