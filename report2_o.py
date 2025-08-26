@@ -1,3 +1,58 @@
+def add_no_setup_or_format_change(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Count consecutive EXISTING status records per business owner by comparing
+    each record with the previous record ordered by ingestion timestamp descending.
+    Counts 1 if both current and previous records have EXISTING status, otherwise 0.
+    """
+    out, owner = df.copy(), _business_owner_col(df)
+    colname = "# of Rosters with no Set up or Format Change"
+    
+    if not owner:
+        out[colname] = 0
+        return out
+    
+    # Check if required columns exist
+    required_cols = [owner, "header_version_status", "ingestion_timestamp"]
+    if not all(col in out.columns for col in required_cols):
+        out[colname] = 0
+        return out
+    
+    # Ensure ingestion_timestamp is datetime
+    out["ingestion_timestamp"] = pd.to_datetime(out["ingestion_timestamp"], errors="coerce")
+    
+    # Sort by owner and ingestion_timestamp descending
+    out_sorted = out.sort_values(by=[owner, "ingestion_timestamp"], ascending=[True, False])
+    
+    # Initialize the result column
+    out[colname] = 0
+    
+    # Group by business owner
+    grouped = out_sorted.groupby(owner)
+    
+    # For each group, check consecutive records
+    for owner_val, group in grouped:
+        if len(group) < 2:
+            continue  # Skip if not enough records for comparison
+        
+        # Reset index for easier manipulation
+        group_reset = group.reset_index(drop=True)
+        
+        # Check each record against the previous one
+        for i in range(1, len(group_reset)):
+            current = group_reset.iloc[i]
+            previous = group_reset.iloc[i-1]
+            
+            # Check if both records have "EXISTING" status
+            if (current["header_version_status"] == "EXISTING" and 
+                previous["header_version_status"] == "EXISTING"):
+                
+                # Get the original index of the current record
+                original_idx = group_reset.index[i]
+                # Set count to 1 for this record
+                out.loc[original_idx, colname] = 1
+    
+    return out
+*************************************
 def add_changed_roster_formats(df: pd.DataFrame) -> pd.DataFrame:
     """
     Count total number of roster format changes per business owner by comparing
