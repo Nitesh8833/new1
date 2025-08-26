@@ -1,5 +1,63 @@
 def add_no_setup_or_format_change(df: pd.DataFrame) -> pd.DataFrame:
     """
+    Count total number of consecutive EXISTING status records with version number 1 per business owner.
+    For each business owner, counts how many times consecutive records (ordered by ingestion timestamp descending)
+    both have "EXISTING" status and version number 1.
+    """
+    out, owner = df.copy(), _business_owner_col(df)
+    colname = "# of Rosters with no Set up or Format Change"
+    
+    if not owner:
+        out[colname] = 0
+        return out
+    
+    # Check if required columns exist
+    required_cols = [owner, "header_version_status", "header_version_number", "ingestion_timestamp"]
+    if not all(col in out.columns for col in required_cols):
+        out[colname] = 0
+        return out
+    
+    # Ensure ingestion_timestamp is datetime
+    out["ingestion_timestamp"] = pd.to_datetime(out["ingestion_timestamp"], errors="coerce")
+    
+    # Sort by owner and ingestion_timestamp descending
+    out_sorted = out.sort_values(by=[owner, "ingestion_timestamp"], ascending=[True, False])
+    
+    # Initialize the result column
+    out[colname] = 0
+    
+    # Group by business owner
+    grouped = out_sorted.groupby(owner)
+    
+    # For each group, count consecutive EXISTING status records with version number 1
+    for owner_val, group in grouped:
+        if len(group) < 2:
+            continue  # Skip if not enough records for comparison
+        
+        # Reset index for easier manipulation
+        group_reset = group.reset_index(drop=True)
+        
+        # Count how many consecutive pairs meet the criteria
+        count = 0
+        for i in range(1, len(group_reset)):
+            current = group_reset.iloc[i]
+            previous = group_reset.iloc[i-1]
+            
+            # Check if both records have "EXISTING" status and version number 1
+            if (current["header_version_status"] == "EXISTING" and 
+                current["header_version_number"] == 1 and
+                previous["header_version_status"] == "EXISTING" and 
+                previous["header_version_number"] == 1):
+                
+                count += 1
+        
+        # Update all rows for this owner with the total count
+        out.loc[out[owner] == owner_val, colname] = count
+    
+    return out
+***************************
+def add_no_setup_or_format_change(df: pd.DataFrame) -> pd.DataFrame:
+    """
     Count consecutive EXISTING status records with version number 1 per business owner by comparing
     each record with the previous record ordered by ingestion timestamp descending.
     Counts 1 if both current and previous records have EXISTING status and version number 1, otherwise 0.
