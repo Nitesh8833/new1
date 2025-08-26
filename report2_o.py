@@ -1,3 +1,81 @@
+def add_changed_roster_formats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Count total number of roster format changes per business owner by comparing
+    all columns between consecutive records ordered by ingestion timestamp.
+    Uses pandas shift to simulate SQL LEAD/LAG functionality.
+    """
+    out, owner = df.copy(), _business_owner_col(df)
+    if not owner:
+        out["# Changed Roster Formats"] = 0
+        return out
+    
+    # Check if required columns exist
+    required_cols = [owner, "insert_timestamp"]
+    if not all(col in out.columns for col in required_cols):
+        out["# Changed Roster Formats"] = 0
+        return out
+    
+    # Ensure insert_timestamp is datetime
+    out["insert_timestamp"] = pd.to_datetime(out["insert_timestamp"], errors="coerce")
+    
+    # Sort by owner and insert_timestamp
+    out_sorted = out.sort_values(by=[owner, "insert_timestamp"])
+    
+    # Group by business owner
+    grouped = out_sorted.groupby(owner)
+    
+    # Function to count changes between consecutive rows
+    def count_changes(group):
+        if len(group) < 2:
+            return pd.Series(0, index=group.index)
+        
+        # Create a shifted version of the group for comparison
+        group_shifted = group.shift(1)
+        
+        # Exclude timestamp columns and the owner column from comparison
+        exclude_cols = ["insert_timestamp", "update_timestamp", owner]
+        compare_cols = [col for col in group.columns if col not in exclude_cols]
+        
+        # Initialize change counts
+        change_counts = pd.Series(0, index=group.index)
+        
+        # For each row starting from the second one, compare with previous
+        for i in range(1, len(group)):
+            current_idx = group.index[i]
+            prev_idx = group.index[i-1]
+            
+            changes = 0
+            for col in compare_cols:
+                try:
+                    current_val = group.loc[current_idx, col]
+                    prev_val = group_shifted.loc[current_idx, col]
+                    
+                    # Handle NaN values properly
+                    if pd.isna(current_val) and pd.isna(prev_val):
+                        continue
+                    elif pd.isna(current_val) or pd.isna(prev_val):
+                        changes += 1
+                    elif current_val != prev_val:
+                        changes += 1
+                except (TypeError, ValueError):
+                    try:
+                        if str(group.loc[current_idx, col]) != str(group_shifted.loc[current_idx, col]):
+                            changes += 1
+                    except:
+                        changes += 1
+            
+            change_counts.loc[current_idx] = changes
+        
+        return change_counts
+    
+    # Apply the function to each group
+    change_counts = grouped.apply(count_changes).reset_index(level=0, drop=True)
+    
+    # Map the results back to the original DataFrame
+    out["# Changed Roster Formats"] = change_counts.reindex(out.index).fillna(0).astype(int)
+    
+    return out
+************************************************************************************8
 import pandas as pd
 
 def add_changed_roster_formats_count_desc(
