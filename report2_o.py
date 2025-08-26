@@ -1,3 +1,61 @@
+def add_new_roster_formats_simple(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Count new roster formats per business owner based on version status and number.
+    Only counts records where header_version_status starts with "NEW" (case-insensitive)
+    and header_version_number equals 1.
+    
+    Args:
+        df: DataFrame containing roster information
+    
+    Returns:
+        DataFrame with added column for new roster format counts
+    """
+    # Create a copy of the DataFrame
+    out = df.copy()
+    
+    # Helper function to identify business owner column
+    def _business_owner_col(df: pd.DataFrame) -> str:
+        """
+        Identify the business owner column.
+        Looks for common variations of business owner column names.
+        """
+        possible_names = ["business_owner", "business_owner_name", "owner", "business_owner_col"]
+        
+        for col_name in possible_names:
+            if col_name in df.columns:
+                return col_name
+        
+        # Return the most common name if none found
+        return "business_owner"
+    
+    # Get business owner column name
+    owner_col = _business_owner_col(out)
+    
+    # Check if required columns exist
+    required_cols = [owner_col, "header_version_status", "header_version_number"]
+    if not all(col in out.columns for col in required_cols):
+        out["# New Roster Formats"] = 0
+        return out
+    
+    # Filter for version 1 and statuses that start with "NEW" (case-insensitive)
+    new_status_condition = (
+        out["header_version_status"].str.upper().str.startswith("NEW")
+    )
+    version_condition = out["header_version_number"] == 1
+    
+    # Apply both conditions
+    is_new = new_status_condition & version_condition
+    
+    # Count by business owner and transform to match original DataFrame length
+    counts = is_new.groupby(out[owner_col]).transform("sum")
+    
+    # Add the count column
+    out["# New Roster Formats"] = counts.astype(int)
+    
+    return out
+***********************************************
 import pandas as pd
 from typing import Tuple, Optional
 
