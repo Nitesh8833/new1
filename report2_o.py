@@ -1,6 +1,79 @@
 def add_changed_roster_formats(df: pd.DataFrame) -> pd.DataFrame:
     """
     Count total number of roster format changes per business owner by comparing
+    all columns between the two most recent records ordered by ingestion timestamp descending.
+    Uses pandas operations to simulate SQL LEAD/LAG functionality.
+    """
+    out, owner = df.copy(), _business_owner_col(df)
+    if not owner:
+        out["# Changed Roster Formats"] = 0
+        return out
+    
+    # Check if required columns exist
+    required_cols = [owner, "ingestion_timestamp"]
+    if not all(col in out.columns for col in required_cols):
+        out["# Changed Roster Formats"] = 0
+        return out
+    
+    # Ensure ingestion_timestamp is datetime
+    out["ingestion_timestamp"] = pd.to_datetime(out["ingestion_timestamp"], errors="coerce")
+    
+    # Sort by owner and ingestion_timestamp descending (newest first)
+    out_sorted = out.sort_values(by=[owner, "ingestion_timestamp"], ascending=[True, False])
+    
+    # Initialize the result column
+    out["# Changed Roster Formats"] = 0
+    
+    # Group by business owner
+    grouped = out_sorted.groupby(owner)
+    
+    # For each group, compare the two most recent records
+    for owner_val, group in grouped:
+        if len(group) < 2:
+            continue  # Skip if not enough records for comparison
+        
+        # Get the two most recent records
+        recent_records = group.head(2)
+        current = recent_records.iloc[0]  # Most recent
+        previous = recent_records.iloc[1]  # Second most recent
+        
+        # Exclude timestamp columns and the owner column from comparison
+        exclude_cols = ["ingestion_timestamp", "insert_timestamp", "update_timestamp", owner]
+        compare_cols = [col for col in group.columns if col not in exclude_cols]
+        
+        # Count differences between current and previous records
+        changes_count = 0
+        for col in compare_cols:
+            try:
+                # Handle NaN values properly
+                current_val = current[col]
+                prev_val = previous[col]
+                
+                if pd.isna(current_val) and pd.isna(prev_val):
+                    continue  # Both are NaN, no change
+                elif pd.isna(current_val) or pd.isna(prev_val):
+                    changes_count += 1  # One is NaN, other is not
+                elif current_val != prev_val:
+                    changes_count += 1  # Values are different
+            except (TypeError, ValueError):
+                # Handle cases where comparison might fail
+                try:
+                    if str(current[col]) != str(previous[col]):
+                        changes_count += 1
+                except:
+                    # If all else fails, count as a change
+                    changes_count += 1
+        
+        # Update all rows for this owner with the total change count
+        out.loc[out[owner] == owner_val, "# Changed Roster Formats"] = changes_count
+    
+    return out
+******************************
+
+
+def add_changed_roster_formats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Count total number of roster format changes per business owner by comparing
     all columns between consecutive records ordered by ingestion timestamp.
     Uses pandas shift to simulate SQL LEAD/LAG functionality.
     """
