@@ -1,5 +1,61 @@
 def add_no_setup_or_format_change(df: pd.DataFrame) -> pd.DataFrame:
     """
+    Count consecutive EXISTING status records with version number 1 per business owner by comparing
+    each record with the previous record ordered by ingestion timestamp descending.
+    Counts 1 if both current and previous records have EXISTING status and version number 1, otherwise 0.
+    """
+    out, owner = df.copy(), _business_owner_col(df)
+    colname = "# of Rosters with no Set up or Format Change"
+    
+    if not owner:
+        out[colname] = 0
+        return out
+    
+    # Check if required columns exist
+    required_cols = [owner, "header_version_status", "header_version_number", "ingestion_timestamp"]
+    if not all(col in out.columns for col in required_cols):
+        out[colname] = 0
+        return out
+    
+    # Ensure ingestion_timestamp is datetime
+    out["ingestion_timestamp"] = pd.to_datetime(out["ingestion_timestamp"], errors="coerce")
+    
+    # Sort by owner and ingestion_timestamp descending
+    out_sorted = out.sort_values(by=[owner, "ingestion_timestamp"], ascending=[True, False])
+    
+    # Group by business owner
+    grouped = out_sorted.groupby(owner)
+    
+    # Function to check consecutive EXISTING status with version number 1
+    def check_consecutive_existing(group):
+        if len(group) < 2:
+            return pd.Series(0, index=group.index)
+        
+        # Shift the status and version columns to compare with previous record
+        prev_status = group["header_version_status"].shift(-1)
+        prev_version = group["header_version_number"].shift(-1)
+        
+        # Check if both current and previous records have EXISTING status and version number 1
+        is_consecutive_existing = (
+            (group["header_version_status"] == "EXISTING") & 
+            (group["header_version_number"] == 1) &
+            (prev_status == "EXISTING") &
+            (prev_version == 1)
+        )
+        
+        # Return 1 for consecutive EXISTING with version 1, 0 otherwise
+        return is_consecutive_existing.astype(int)
+    
+    # Apply the function to each group
+    consecutive_counts = grouped.apply(check_consecutive_existing).reset_index(level=0, drop=True)
+    
+    # Map the results back to the original DataFrame
+    out[colname] = consecutive_counts.reindex(out.index).fillna(0).astype(int)
+    
+    return out
+*************************************************
+def add_no_setup_or_format_change(df: pd.DataFrame) -> pd.DataFrame:
+    """
     Count consecutive EXISTING status records per business owner by comparing
     each record with the previous record ordered by ingestion timestamp descending.
     Counts 1 if both current and previous records have EXISTING status, otherwise 0.
