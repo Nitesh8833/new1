@@ -1,179 +1,28 @@
-def _apply_transformations(
-    df: pd.DataFrame,
-    mapping: dict,
-    *,
-    keep_unmapped: bool = False,          # <— NEW parameter
-    extra_output_cols: list[str] | None = None,
-) -> pd.DataFrame:
-    out = df.copy()
-
-    # Derive "File Name" if file_path exists
-    if "file_path" in out.columns and "File Name" not in mapping.values():
-        out["File Name"] = out["file_path"].astype(str).str.extract(r"([^/\\]+)$")
-
-    # Rename only present sources
-    present_map = {src: dst for src, dst in mapping.items() if src in out.columns}
-    out = out.rename(columns=present_map)
-
-    # Fix big IDs for Excel
-    for big_id in ("roster_file_id", "conformed_file_id"):
-        if big_id in out.columns:
-            out[big_id] = out[big_id].astype("string")
-
-    if keep_unmapped:
-        mapped_order = [present_map[s] for s in mapping if s in present_map]
-        rest = [c for c in out.columns if c not in mapped_order]
-        extras = [c for c in (extra_output_cols or []) if c in out.columns and c not in mapped_order]
-        rest = [c for c in rest if c not in extras]
-        return out[mapped_order + extras + rest]
-
-    # SELECT-ONLY mode (your case)
-    selected = [present_map[s] for s in mapping if s in present_map]
-    if extra_output_cols:
-        selected += [c for c in extra_output_cols if c in out.columns and c not in selected]
-    return out[selected]
-
-*******************************
-{
-  "database": { "...": "..." },
-  "gcs": { "...": "..." },
-  "sql_query1": "SELECT ...",
-  "sql_query2": "SELECT ...",
-  "mapping": {
-    "roster_id": "Roster ID",
-    "state": "state",
-    "business_owner": "Medicare_Commercial",
-    "group_type": "Group Team",
-    "roster_name": "Provider Entity",
-    "parent_transaction_type": "Parent Transaction Type",
-    "case_number": "Case Number",
-    "transaction_type": "Transaction Type",
-    "input_rec_count": "Total Number Of Rows",
-    "total_rows_with_errors": "Total Rows With Errors",
-    "file_path": "File Name",
-    "critical_error_codes": "Error Code",
-    "complexity": "complexity",
-    "received_date": "received_date",
-    "version_number": "version_number",
-    "version_status": "version_status",
-    "status": "status"
-  },
-  "outputs": {
-    "q1_enriched": {
-      "gs_uri": "gs://your-bucket/report/prvrostercnf_file_stats_enriched_{today_str}.xlsx",
-      "fmt": "xlsx",
-      "sheet": "EnrichedData",
-      "auto_increment": true
-    }
-  }
-}
-
-******************************8
-def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
-    cfg = load_config(config_path)
-
-    db_cfg   = cfg["database"]
-    gcs_cfg  = cfg.get("gcs", {})
-    # mapping for Q1 (main table)
-    mapping_q1 = cfg.get("mapping", MAPPING)
-    # mapping for Q2 (codes table) typically empty
-    mapping_q2 = cfg.get("mapping_q2", {})
-
-    outs                = cfg.get("outputs", {}) or {}
-    out_cfg_q1_enriched = outs.get("q1_enriched", {})  # <-- only one we’ll write
-
-    # ---------- 1) Pull both queries into memory ----------
-    df1 = run_query_to_df(sql=cfg["sql_query1"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q1)
-    df2 = run_query_to_df(sql=cfg["sql_query2"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q2)
-
-    # ---------- 2) Build code -> description map and enrich df1 ----------
-    codes_to_desc = _codes_to_descriptions_builder(df2)  # your existing helper
-    df1_enriched  = df1.copy()
-    if "Error Code" in df1_enriched.columns:
-        df1_enriched["Error Descriptions"] = df1_enriched["Error Code"].apply(codes_to_desc)
-    else:
-        logging.warning("Column 'Error Code' not found in Q1 output; skipping enrichment.")
-        df1_enriched["Error Descriptions"] = ""
-
-    # ---------- 3) Select ONLY mapped columns (+ Error Descriptions) ----------
-    # keep_unmapped=False makes it 'select-only'
-    df1_enriched = _apply_transformations(
-        df1_enriched,
-        mapping_q1,
-        keep_unmapped=False,
-        extra_output_cols=["Error Descriptions"]  # append enrichment column
-    )
-
-    # ---------- 4) Write ONLY the enriched output ----------
-    if not out_cfg_q1_enriched:
-        # If config didn’t specify, mirror q1 target name with "_enriched"
-        out_cfg_q1 = outs.get("q1", {})
-        if out_cfg_q1 and out_cfg_q1.get("gs_uri"):
-            bkt, obj = _parse_gs_uri(out_cfg_q1["gs_uri"])
-            obj_enriched = re.sub(r"(\.xlsx|\.csv)$", r"_enriched\1", obj)
-            gs_uri = f"gs://{bkt}/{obj_enriched}"
-        elif out_cfg_q1 and out_cfg_q1.get("bucket") and out_cfg_q1.get("object_name"):
-            bkt = out_cfg_q1["bucket"]
-            obj = out_cfg_q1["object_name"]
-            obj_enriched = re.sub(r"(\.xlsx|\.csv)$", r"_enriched\1", obj)
-            gs_uri = f"gs://{bkt}/{obj_enriched}"
-        else:
-            raise ValueError("No outputs.q1_enriched and no base outputs.q1 to mirror.")
-        out_cfg_q1_enriched = {"gs_uri": gs_uri, "fmt": DEFAULT_OUTPUT_FMT, "sheet": "Query1_Enriched", "auto_increment": True}
-
-    enriched_uri = write_df_to_gcs(
-        df1_enriched,
-        gs_uri=out_cfg_q1_enriched.get("gs_uri"),
-        bucket=out_cfg_q1_enriched.get("bucket"),
-        object_name=out_cfg_q1_enriched.get("object_name"),
-        fmt=out_cfg_q1_enriched.get("fmt", DEFAULT_OUTPUT_FMT),
-        sheet_name=out_cfg_q1_enriched.get("sheet", "Query1_Enriched"),
-        auto_increment=out_cfg_q1_enriched.get("auto_increment", True),
-    )
-
-    return {"q1_enriched_uri": enriched_uri}
-
-**********************************
-def strip_tz_from_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of df with all timezone-aware datetimes converted to tz-naive."""
-    out = df.copy()
-
-    # 1) Handle datetime64[ns, tz] dtypes
-    for col in out.select_dtypes(include=["datetimetz"]).columns:
-        out[col] = out[col].dt.tz_convert("UTC").dt.tz_localize(None)
-
-    # 2) Handle object columns that may contain tz-aware datetime objects
-    for col in out.columns[out.dtypes.eq("object")]:
-        mask = out[col].map(lambda x: getattr(getattr(x, "tzinfo", None), "utcoffset", None) is not None)
-        if mask.any():
-            tmp = pd.to_datetime(out.loc[mask, col], errors="coerce", utc=True)
-            out.loc[mask, col] = tmp.dt.tz_localize(None)
-
-    return out
-
-*********************
 from __future__ import annotations
+
 import io
 import json
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Iterable, Optional, Tuple, Union
 
 import pandas as pd
 import psycopg2
-from google.cloud import storage
-from google.cloud import secretmanager
+from google.cloud import storage, secretmanager
 from google.auth import default as gauth_default
-from collections import OrderedDict
+
+# -------------------- logging & defaults --------------------
 
 LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format="%(levelname)s %(message)s")
-CONFIG_PATH = "gs://us-east4-cmp-dev-pdi-ink-05-5e6953c0-bucket/dags/pdi-ingestion-gcp/Dev/config/db_config1.json"
+
+CONFIG_PATH = "gs://<bucket>/path/to/db_config.json"  # <-- set or pass to run_both_queries_from_config
 DEFAULT_OUTPUT_FMT = "xlsx"
 DEFAULT_OUTPUT_SHEET = "Sheet1"
 
-# --- helpers ---
+# -------------------- helpers --------------------
+
 def parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
     if not gs_uri.startswith("gs://"):
         raise ValueError("gs_uri must start with gs://")
@@ -183,7 +32,7 @@ def parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
     return bucket, obj
 
 def next_available_name(client: storage.Client, bucket: str, obj: str) -> str:
-    m = re.match(r"^(.*?)(\.[^.]*)?$", obj)
+    m = re.match(r"^(.*?)(\.[^.]+)?$", obj)
     stem, ext = (m.group(1), m.group(2) or "")
     i = 1
     b = client.bucket(bucket)
@@ -193,12 +42,12 @@ def next_available_name(client: storage.Client, bucket: str, obj: str) -> str:
     return obj
 
 def suffix_path(obj: str, suffix: str) -> str:
-    """Insert suffix before extension: a/b/c.xlsx -> a/b/c_suffix.xlsx"""
-    m = re.match(r"^(.*?)(\.[^.]*)?$", obj)
+    m = re.match(r"^(.*?)(\.[^.]+)?$", obj)
     stem, ext = (m.group(1), m.group(2) or "")
     return f"{stem}{suffix}{ext}"
 
-# --- config & secrets ---
+# -------------------- config & secrets --------------------
+
 def load_config(ref: Union[str, Path] = CONFIG_PATH) -> dict:
     ref = str(ref)
     if ref.startswith("gs://"):
@@ -207,9 +56,8 @@ def load_config(ref: Union[str, Path] = CONFIG_PATH) -> dict:
         bucket = client.bucket(bucket_name)
         text = bucket.blob(blob_path).download_as_text()
         return json.loads(text)
-    else:
-        with open(ref, "r") as f:
-            return json.load(f)
+    with open(ref, "r") as f:
+        return json.load(f)
 
 def get_secret_value(project_id: str, secret_name: str, creds, version: str = "latest") -> str:
     client = secretmanager.SecretManagerServiceClient(credentials=creds)
@@ -225,35 +73,33 @@ def get_db_credentials(project_id: str, creds) -> dict:
         "host": get_secret_value(project_id, "pdi_prvrstrcnf_cloud_sql_host_ip", creds),
     }
 
-# --- DB connection ---
+# -------------------- DB connection --------------------
+
 def get_db_connection_with_gcs_certs(
     dbname: str,
-    user: str,
-    password: str,
-    host: str,
+    user: Optional[str],
+    password: Optional[str],
+    host: Optional[str],
     port: int,
     bucket_name: Optional[str] = None,
     client_cert_gcs: Optional[str] = None,
     client_key_gcs: Optional[str] = None,
     server_ca_gcs: Optional[str] = None,
 ):
-    # Get credentials using the default authentication
     creds, project_id = gauth_default()
     sm = get_db_credentials(project_id, creds)
-    
-    """
-    Minimal connection (no SSL certs used here).
-    """
     conn = psycopg2.connect(
         dbname=dbname,
-        user=sm["user"],
-        password=sm["password"],
-        host=sm["host"],
+        user=user or sm["user"],
+        password=password or sm["password"],
+        host=host or sm["host"],
         port=port,
+        # If you need SSL, add sslmode/sslrootcert/sslcert/sslkey here using GCS paths above.
     )
     return conn
 
-# --- transformations ---
+# -------------------- transformations --------------------
+
 MAPPING: Dict[str, str] = {
     "business_owner": "Medicare_Commercial",
     "group_type": "Group Team",
@@ -265,19 +111,44 @@ MAPPING: Dict[str, str] = {
     "input_rec_count": "Total Number Of Rows",
     "total_rows_with_errors": "Total Rows With Errors",
     "critical_error_codes": "Error Code",
-    "error_details": "Error Description",
+    "error_details": "Error Description",  # optional passthrough if present
+    # add as needed...
 }
 
-def _apply_transformations(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    df = df.copy()
-    if "file_path" in df.columns and "File Name" not in mapping.values():
-        df["File Name"] = df["file_path"].astype(str).str.extract(r"([^/\\]+)$")
-    present_map = {src: dst for src, dst in mapping.items() if src in df.columns}
-    df = df.rename(columns=present_map)
-    ordered = [present_map.get(k, None) for k in mapping.keys() if k in df.columns]
-    ordered += [c for c in df.columns if c not in ordered]
-    df = df[ordered]
-    return df
+def _apply_transformations(
+    df: pd.DataFrame,
+    mapping: dict,
+    *,
+    keep_unmapped: bool = False,
+    extra_output_cols: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    # Derive "File Name" if file_path exists and not already mapped
+    if "file_path" in out.columns and "File Name" not in mapping.values():
+        out["File Name"] = out["file_path"].astype(str).str.extract(r"([^/\\]+)$")
+
+    # Rename only present sources
+    present_map = {src: dst for src, dst in mapping.items() if src in out.columns}
+    out = out.rename(columns=present_map)
+
+    # Avoid scientific notation issues for very large IDs
+    for big_id in ("roster_file_id", "conformed_file_id"):
+        if big_id in out.columns:
+            out[big_id] = out[big_id].astype("string")
+
+    if keep_unmapped:
+        mapped_order = [present_map[s] for s in mapping if s in present_map]
+        rest = [c for c in out.columns if c not in mapped_order]
+        extras = [c for c in (extra_output_cols or []) if c in out.columns and c not in mapped_order]
+        rest = [c for c in rest if c not in extras]
+        return out[mapped_order + extras + rest]
+
+    # SELECT-ONLY
+    selected = [present_map[s] for s in mapping if s in present_map]
+    if extra_output_cols:
+        selected += [c for c in extra_output_cols if c in out.columns and c not in selected]
+    return out[selected]
 
 def _autosize_and_freeze_openpyxl(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str = DEFAULT_OUTPUT_SHEET):
     from openpyxl.utils import get_column_letter
@@ -289,6 +160,22 @@ def _autosize_and_freeze_openpyxl(writer: pd.ExcelWriter, df: pd.DataFrame, shee
         except Exception:
             max_len = len(col) + 2
         ws.column_dimensions[get_column_letter(idx)].width = min(max_len, 80)
+
+def strip_tz_from_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df with tz-aware datetimes converted to tz-naive (Excel-safe)."""
+    out = df.copy()
+    # tz-aware datetime64 dtypes
+    for col in out.select_dtypes(include=["datetimetz"]).columns:
+        out[col] = out[col].dt.tz_convert("UTC").dt.tz_localize(None)
+    # object columns that may hold datetime objects
+    for col in out.columns[out.dtypes.eq("object")]:
+        mask = out[col].map(lambda x: getattr(getattr(x, "tzinfo", None), "utcoffset", None) is not None)
+        if mask.any():
+            tmp = pd.to_datetime(out.loc[mask, col], errors="coerce", utc=True)
+            out.loc[mask, col] = tmp.dt.tz_localize(None)
+    return out
+
+# -------------------- write to GCS --------------------
 
 def write_df_to_gcs(
     df: pd.DataFrame,
@@ -319,9 +206,10 @@ def write_df_to_gcs(
         blob.upload_from_string(payload, content_type="text/csv")
     elif fmt == "xlsx":
         bio = io.BytesIO()
+        safe_df = strip_tz_from_datetime(df)
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet_name)
-            _autosize_and_freeze_openpyxl(writer, df, sheet_name)
+            safe_df.to_excel(writer, index=False, sheet_name=sheet_name)
+            _autosize_and_freeze_openpyxl(writer, safe_df, sheet_name)
         bio.seek(0)
         blob.upload_from_file(
             bio,
@@ -334,17 +222,23 @@ def write_df_to_gcs(
     logging.info("[OUT %s -> %s]", fmt.upper(), out_uri)
     return out_uri
 
-# --- core runner ---
-def run_query_to_df(*, sql: str, db_cfg: dict, gcs_cfg: dict, mapping: Dict[str, str]) -> pd.DataFrame:
-    """Executes SQL -> DataFrame, applies mapping (and File Name derivation) in-memory, no GCS write."""
+# -------------------- core runners --------------------
+
+def run_query_to_df(
+    *,
+    sql: str,
+    db_cfg: dict,
+    gcs_cfg: dict,
+) -> pd.DataFrame:
+    """Executes SQL -> DataFrame; no write."""
     creds, project_id = gauth_default()
     sm = get_db_credentials(project_id, creds)
 
     conn = get_db_connection_with_gcs_certs(
         dbname=db_cfg["dbname"],
-        user=sm["user"],
-        password=sm["password"],
-        host=sm["host"],
+        user=db_cfg.get("user", sm["user"]),
+        password=db_cfg.get("password", sm["password"]),
+        host=db_cfg.get("host", sm["host"]),
         port=int(db_cfg.get("port", 5432)),
         bucket_name=gcs_cfg.get("bucket_name"),
         client_cert_gcs=gcs_cfg.get("client_cert"),
@@ -353,119 +247,114 @@ def run_query_to_df(*, sql: str, db_cfg: dict, gcs_cfg: dict, mapping: Dict[str,
     )
     try:
         df_src = pd.read_sql_query(sql, con=conn)
+        logging.info("Query returned rows=%d cols=%d", len(df_src), len(df_src.columns))
     finally:
         conn.close()
+    return df_src
 
-    return _apply_transformations(df_src, mapping)
+def _find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    """Return actual column name matching any candidate (case/space-insensitive)."""
+    norm = {c.lower().replace(" ", ""): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower().replace(" ", "")
+        if key in norm:
+            return norm[key]
+    return None
 
-def _codes_to_descriptions_builder(error_codes_df: pd.DataFrame):
-    """Return a function codes_str -> 'desc1, desc2' using codes map from df."""
-    code_to_desc = error_codes_df.set_index("error_code")["description"].to_dict()
-
-    def codes_to_descriptions(codes_str: str) -> str:
-        if pd.isna(codes_str) or not str(codes_str).strip():
-            return ""
-        seen = OrderedDict()
-        for raw in str(codes_str).split(","):
-            code = raw.strip()
-            if code and code in code_to_desc:
-                seen[code_to_desc[code]] = None
-        return ", ".join(seen.keys())
-
-    return codes_to_descriptions
+def _codes_to_descriptions_map(df_codes: pd.DataFrame) -> Dict[str, str]:
+    """Build {error_code: description} robustly."""
+    err_col  = _find_col(df_codes, ["error_code", "errorcode", "code"])
+    desc_col = _find_col(df_codes, ["description", "desc", "error_description", "errordescription"])
+    if not (err_col and desc_col):
+        logging.warning("Codes table missing columns. Present: %s", list(df_codes.columns))
+        return {}
+    tmp = (
+        df_codes[[err_col, desc_col]]
+        .dropna(subset=[err_col])
+        .assign(**{
+            err_col:  lambda d: d[err_col].astype(str).str.strip(),
+            desc_col: lambda d: d[desc_col].astype(str).str.strip(),
+        })
+        .drop_duplicates(subset=[err_col])
+    )
+    return tmp.set_index(err_col)[desc_col].to_dict()
 
 def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
     cfg = load_config(config_path)
 
-    db_cfg = cfg["database"]
+    db_cfg  = cfg["database"]
     gcs_cfg = cfg.get("gcs", {})
     mapping_q1 = cfg.get("mapping", MAPPING)
-    mapping_q2 = cfg.get("mapping_q2", {})  # usually empty for codes table
 
     outs = cfg.get("outputs", {}) or {}
-    out_cfg_q1 = outs.get("q1", {})  # optional
-    out_cfg_q2 = outs.get("q2", {})  # optional
-    out_cfg_q1_enriched = outs.get("q1_enriched", {})  # recommended
+    out_cfg_q1_enriched = outs.get("q1_enriched", {})  # ONLY this is written
 
-    # --- 1) Run both queries INTO MEMORY (no writes yet) ---
-    df1 = run_query_to_df(sql=cfg["sql_query1"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q1)
-    df2 = run_query_to_df(sql=cfg["sql_query2"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q2)
+    # 1) Run both queries
+    df1 = run_query_to_df(sql=cfg["sql_query1"], db_cfg=db_cfg, gcs_cfg=gcs_cfg)
+    df2 = run_query_to_df(sql=cfg["sql_query2"], db_cfg=db_cfg, gcs_cfg=gcs_cfg)
 
-    # --- 2) Build code -> description map and enrich df1 ---
-    codes_to_desc = _codes_to_descriptions_builder(df2)
-    df1_enriched = df1.copy()
-    if "Error Code" in df1_enriched.columns:
-        df1_enriched["Error Descriptions"] = df1_enriched["Error Code"].apply(codes_to_desc)
+    # 2) Enrich df1
+    code_map = _codes_to_descriptions_map(df2)
+    df1["Error Descriptions"] = ""
+    if code_map and "critical_error_codes" in df1.columns:
+        def _map_codes(raw):
+            if pd.isna(raw) or not str(raw).strip():
+                return ""
+            parts = [p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()]
+            return ", ".join([code_map.get(p, p) for p in parts])
+        df1["Error Descriptions"] = df1["critical_error_codes"].map(_map_codes)
+    elif code_map and "Error Code" in df1.columns:
+        def _map_codes2(raw):
+            if pd.isna(raw) or not str(raw).strip():
+                return ""
+            parts = [p.strip() for p in str(raw).replace(";", ",").split(",") if p.strip()]
+            return ", ".join([code_map.get(p, p) for p in parts])
+        df1["Error Descriptions"] = df1["Error Code"].map(_map_codes2)
     else:
-        logging.warning("Column 'Error Code' not found in Q1 output; skipping enrichment.")
-        df1_enriched["Error Descriptions"] = ""
+        logging.info("No error code column or empty codes map; enrichment left blank.")
 
-    # --- 3) Write only what you want ---
-    uris = {}
-    
-    # (optional) write raw Q1
-    if out_cfg_q1:
-        uris["q1_uri"] = write_df_to_gcs(
-            df1,
-            gs_uri=out_cfg_q1.get("gs_uri"),
-            bucket=out_cfg_q1.get("bucket"),
-            object_name=out_cfg_q1.get("object_name"),
-            fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
-            sheet_name=out_cfg_q1.get("sheet_name", "Query1"),
-            auto_increment=out_cfg_q1.get("auto_increment", True),
-        )
+    # 3) Select ONLY mapped columns (+ Error Descriptions)
+    df1_enriched = _apply_transformations(
+        df1,
+        mapping_q1,
+        keep_unmapped=False,                        # select-only
+        extra_output_cols=["Error Descriptions"],   # force enrichment column
+    )
 
-    # (optional) write Q2 reference table
-    if out_cfg_q2:
-        uris["q2_uri"] = write_df_to_gcs(
-            df2,
-            gs_uri=out_cfg_q2.get("gs_uri"),
-            bucket=out_cfg_q2.get("bucket"),
-            object_name=out_cfg_q2.get("object_name"),
-            fmt=out_cfg_q2.get("fmt", DEFAULT_OUTPUT_FMT),
-            sheet_name=out_cfg_q2.get("sheet_name", "Query2"),
-            auto_increment=out_cfg_q2.get("auto_increment", True),
-        )
-
-    # (recommended) write enriched Q1
-    if out_cfg_q1_enriched:
-        uris["q1_enriched_uri"] = write_df_to_gcs(
+    # 4) Write ONLY enriched output
+    if out_cfg_q1_enriched.get("gs_uri") or (out_cfg_q1_enriched.get("bucket") and out_cfg_q1_enriched.get("object_name")):
+        enriched_uri = write_df_to_gcs(
             df1_enriched,
             gs_uri=out_cfg_q1_enriched.get("gs_uri"),
             bucket=out_cfg_q1_enriched.get("bucket"),
             object_name=out_cfg_q1_enriched.get("object_name"),
             fmt=out_cfg_q1_enriched.get("fmt", DEFAULT_OUTPUT_FMT),
-            sheet_name=out_cfg_q1_enriched.get("sheet_name", "Query1_Enriched"),
+            sheet_name=out_cfg_q1_enriched.get("sheet", "Query1_Enriched"),
             auto_increment=out_cfg_q1_enriched.get("auto_increment", True),
         )
     else:
-        # If no explicit target for enriched, but q1 destination exists, mirror it with `enriched`
-        if out_cfg_q1 and out_cfg_q1.get("gs_uri"):
+        # Mirror a base Q1 destination if present
+        out_cfg_q1 = outs.get("q1", {})
+        if out_cfg_q1.get("gs_uri"):
             bkt, obj = parse_gs_uri(out_cfg_q1["gs_uri"])
-            uris["q1_enriched_uri"] = write_df_to_gcs(
-                df1_enriched,
-                bucket=bkt,
-                object_name=suffix_path(obj, "_enriched"),
-                fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
-                sheet_name="Query1_Enriched",
-                auto_increment=True,
-            )
-        elif out_cfg_q1 and out_cfg_q1.get("bucket") and out_cfg_q1.get("object_name"):
-            uris["q1_enriched_uri"] = write_df_to_gcs(
-                df1_enriched,
-                bucket=out_cfg_q1["bucket"],
-                object_name=suffix_path(out_cfg_q1["object_name"], "_enriched"),
-                fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
-                sheet_name="Query1_Enriched",
-                auto_increment=True,
-            )
+            gs_uri = f"gs://{bkt}/{suffix_path(obj, '_enriched')}"
+        elif out_cfg_q1.get("bucket") and out_cfg_q1.get("object_name"):
+            gs_uri = f"gs://{out_cfg_q1['bucket']}/{suffix_path(out_cfg_q1['object_name'], '_enriched')}"
         else:
-            # no destination provided at all; help in-memory only.
-            logging.info("No outputs.q1_enriched and no outputs.q1 destination; enriched result kept in-memory only.")
+            raise ValueError("outputs.q1_enriched not set and no outputs.q1 to mirror.")
+        enriched_uri = write_df_to_gcs(
+            df1_enriched,
+            gs_uri=gs_uri,
+            fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
+            sheet_name="Query1_Enriched",
+            auto_increment=True,
+        )
 
-    return uris
+    logging.info("Enriched written: %s", enriched_uri)
+    return {"q1_enriched_uri": enriched_uri, "df1_enriched": df1_enriched}
 
-# --- main ---
+# -------------------- main --------------------
+
 if __name__ == "__main__":
-    uris = run_both_queries_from_config(CONFIG_PATH)
-    print(uris)
+    result = run_both_queries_from_config(CONFIG_PATH)
+    print("Wrote:", result["q1_enriched_uri"])
