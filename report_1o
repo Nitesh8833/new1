@@ -1,4 +1,48 @@
 import pandas as pd
+from collections import OrderedDict
+
+# Assume roster_df and error_codes_df already loaded from earlier
+# If not, uncomment the next two lines:
+# roster_df = pd.read_excel("/mnt/data/roster_data.xlsx")
+# error_codes_df = pd.read_excel("/mnt/data/error_codes.xlsx")
+
+# Build a mapping from code -> description
+code_to_desc = (
+    error_codes_df
+    .set_index("error_code")["description"]
+    .to_dict()
+)
+
+def codes_to_descriptions(codes_str: str) -> str:
+    """Turn 'E002, E010, ...' into 'Missing NPI TYPE 1, Missing PROVIDER EFFECTIVE DATE, ...'
+       - preserves the original order
+       - removes duplicates
+       - skips unknown/blank codes gracefully
+    """
+    if pd.isna(codes_str) or not str(codes_str).strip():
+        return ""
+    # Split, strip, preserve order & uniqueness
+    seen = OrderedDict()
+    for raw in str(codes_str).split(","):
+        code = raw.strip()
+        if not code:
+            continue
+        desc = code_to_desc.get(code, "")
+        if desc:
+            seen[desc] = None  # acts like an ordered set
+    return ", ".join(seen.keys())
+
+# Create the new column
+roster_df["Error Descriptions"] = roster_df["Error Code"].apply(codes_to_descriptions)
+
+# Save result to Excel
+outfile = "/mnt/data/roster_with_error_descriptions.xlsx"
+roster_df.to_excel(outfile, index=False)
+
+outfile, roster_df[["Error Code", "Error Descriptions"]].head()
+
+*******************************************************************
+import pandas as pd
 
 # Load both Excel files into DataFrames
 roster_df = pd.read_excel("/mnt/data/roster_data.xlsx")
