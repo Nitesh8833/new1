@@ -1,3 +1,66 @@
+
+import os
+import pandas as pd
+
+def _apply_transformations(
+    df: pd.DataFrame,
+    mapping: dict,
+    *,
+    keep_unmapped: bool = False,
+    extra_output_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    # 1) Derive "File Name" from file_path (handles / or \ separators)
+    if "file_path" in out.columns and "File Name" not in out.columns:
+        out["File Name"] = out["file_path"].apply(
+            lambda x: os.path.basename(str(x)) if pd.notnull(x) else ""
+        )
+
+    # 2) Rename only the columns that exist according to mapping
+    present_map = {src: dst for src, dst in mapping.items() if src in out.columns}
+    out = out.rename(columns=present_map)
+
+    # 3) Make large IDs strings so Excel won’t scientific-notation them
+    for big_id in ("roster_file_id", "conformed_file_id"):
+        if big_id in out.columns:
+            out[big_id] = out[big_id].astype("string")
+
+    # 4) Column selection / ordering
+    if keep_unmapped:
+        # keep everything, but put mapped first, then extras (with File Name right after Error Descriptions), then the rest
+        mapped_order = [present_map[s] for s in mapping if s in present_map]
+        extras = [c for c in (extra_output_cols or []) if c in out.columns and c not in mapped_order]
+        rest = [c for c in out.columns if c not in mapped_order and c not in extras]
+
+        # Ensure "File Name" sits right after "Error Descriptions" within extras
+        if "File Name" in out.columns:
+            if "File Name" in extras:
+                extras.remove("File Name")
+            if "Error Descriptions" in extras:
+                extras.insert(extras.index("Error Descriptions") + 1, "File Name")
+            else:
+                extras.append("File Name")
+
+        return out[mapped_order + extras + rest]
+    else:
+        # SELECT-ONLY: mapped columns + extras; put "File Name" right after "Error Descriptions"
+        selected = [present_map[s] for s in mapping if s in present_map]
+
+        # add extras first (e.g., "Error Descriptions")
+        extras = [c for c in (extra_output_cols or []) if c in out.columns and c not in selected]
+        selected += extras
+
+        # place File Name right after Error Descriptions if present, else at end
+        if "File Name" in out.columns and "File Name" not in selected:
+            if "Error Descriptions" in selected:
+                selected.insert(selected.index("Error Descriptions") + 1, "File Name")
+            else:
+                selected.append("File Name")
+
+        return out[selected]
+
+**************************
 def strip_tz_from_datetime(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of df with all timezone-aware datetimes converted to tz-naive."""
     out = df.copy()
