@@ -1,3 +1,39 @@
+def _apply_transformations(
+    df: pd.DataFrame,
+    mapping: dict,
+    *,
+    keep_unmapped: bool = False,          # <— NEW parameter
+    extra_output_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    # Derive "File Name" if file_path exists
+    if "file_path" in out.columns and "File Name" not in mapping.values():
+        out["File Name"] = out["file_path"].astype(str).str.extract(r"([^/\\]+)$")
+
+    # Rename only present sources
+    present_map = {src: dst for src, dst in mapping.items() if src in out.columns}
+    out = out.rename(columns=present_map)
+
+    # Fix big IDs for Excel
+    for big_id in ("roster_file_id", "conformed_file_id"):
+        if big_id in out.columns:
+            out[big_id] = out[big_id].astype("string")
+
+    if keep_unmapped:
+        mapped_order = [present_map[s] for s in mapping if s in present_map]
+        rest = [c for c in out.columns if c not in mapped_order]
+        extras = [c for c in (extra_output_cols or []) if c in out.columns and c not in mapped_order]
+        rest = [c for c in rest if c not in extras]
+        return out[mapped_order + extras + rest]
+
+    # SELECT-ONLY mode (your case)
+    selected = [present_map[s] for s in mapping if s in present_map]
+    if extra_output_cols:
+        selected += [c for c in extra_output_cols if c in out.columns and c not in selected]
+    return out[selected]
+
+*******************************
 {
   "database": { "...": "..." },
   "gcs": { "...": "..." },
