@@ -1,3 +1,27 @@
+
+if keep_unmapped:
+        # keep everything, but put mapped first, then extras, then the rest
+        mapped_order = [present_map[s] for s in mapping if s in present_map]
+        extras = [c for c in (extra_output_cols or []) if c in out.columns and c not in mapped_order]
+        rest = [c for c in out.columns if c not in mapped_order and c not in extras]
+        # ensure File Name appears (if present) near the front (after extras)
+        if "File Name" in out.columns and "File Name" not in mapped_order + extras:
+            extras.append("File Name")
+        return out[mapped_order + extras + rest]
+    else:
+        # SELECT-ONLY: mapped columns + extras + ALWAYS include "File Name"
+        selected = [present_map[s] for s in mapping if s in present_map]
+
+        # always include File Name if present
+        if "File Name" in out.columns and "File Name" not in selected:
+            selected.append("File Name")
+
+        # include any requested extra columns (e.g., "Error Descriptions")
+        if extra_output_cols:
+            selected += [c for c in extra_output_cols if c in out.columns and c not in selected]
+
+        return out[selected]
+***************************************************************
 from __future__ import annotations
 
 import io
