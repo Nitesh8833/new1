@@ -57,13 +57,6 @@ def load_config(ref: Union[str, Path] = CONFIG_PATH) -> dict:
         with open(ref, "r") as f:
             return json.load(f)
 
-def __secret_fullname(project_id: str, secret_name_or_full: str, version: str) -> str:
-    if "/secrets/" in secret_name_or_full:
-        if "/versions/" in secret_name_or_full:
-            return secret_name_or_full
-        return f"{secret_name_or_full}/versions/{version}"
-    return f"projects/{project_id}/secrets/{secret_name_or_full}/versions/{version}"
-
 def get_secret_value(project_id: str, secret_name: str, creds, version: str = "latest") -> str:
     client = secretmanager.SecretManagerServiceClient(credentials=creds)
     name = f"projects/{project_id}/secrets/{secret_name}/versions/{version}"
@@ -71,11 +64,11 @@ def get_secret_value(project_id: str, secret_name: str, creds, version: str = "l
     resp = client.access_secret_version(name=name)
     return resp.payload.data.decode("utf-8")
 
-def get_db_credentials(project_id: str, creds, secret_config: dict) -> dict:
+def get_db_credentials(project_id: str, creds) -> dict:
     return {
-        "user": get_secret_value(project_id, secret_config["user"], creds),
-        "password": get_secret_value(project_id, secret_config["password"], creds),
-        "host": get_secret_value(project_id, secret_config["host"], creds),
+        "user": get_secret_value(project_id, "pdi_prvrstrcnf_cloud_sql_user", creds),
+        "password": get_secret_value(project_id, "pdi_prvrstrcnf_cloud_sql_password", creds),
+        "host": get_secret_value(project_id, "pdi_prvrstrcnf_cloud_sql_host_ip", creds),
     }
 
 # --- DB connection ---
@@ -89,15 +82,19 @@ def get_db_connection_with_gcs_certs(
     client_cert_gcs: Optional[str] = None,
     client_key_gcs: Optional[str] = None,
     server_ca_gcs: Optional[str] = None,
-    creds=None,
-    project_id: Optional[str] = None
 ):
-    """Minimal connection (no SSL certs used here)."""
+    # Get credentials using the default authentication
+    creds, project_id = gauth_default()
+    sm = get_db_credentials(project_id, creds)
+    
+    """
+    Minimal connection (no SSL certs used here).
+    """
     conn = psycopg2.connect(
         dbname=dbname,
-        user=user,
-        password=password,
-        host=host,
+        user=sm["user"],
+        password=sm["password"],
+        host=sm["host"],
         port=port,
     )
     return conn
@@ -187,7 +184,7 @@ def write_df_to_gcs(
 def run_query_to_df(*, sql: str, db_cfg: dict, gcs_cfg: dict, mapping: Dict[str, str]) -> pd.DataFrame:
     """Executes SQL -> DataFrame, applies mapping (and File Name derivation) in-memory, no GCS write."""
     creds, project_id = gauth_default()
-    sm = get_db_credentials(project_id, creds, db_cfg["secrets"])
+    sm = get_db_credentials(project_id, creds)
 
     conn = get_db_connection_with_gcs_certs(
         dbname=db_cfg["dbname"],
@@ -199,8 +196,6 @@ def run_query_to_df(*, sql: str, db_cfg: dict, gcs_cfg: dict, mapping: Dict[str,
         client_cert_gcs=gcs_cfg.get("client_cert"),
         client_key_gcs=gcs_cfg.get("client_key"),
         server_ca_gcs=gcs_cfg.get("server_ca"),
-        creds=creds,
-        project_id=project_id
     )
     try:
         df_src = pd.read_sql_query(sql, con=conn)
