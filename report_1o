@@ -1,3 +1,122 @@
+def run_query_to_df(*, sql: str, db_cfg: dict, gcs_cfg: dict, mapping: Dict[str, str]) -> pd.DataFrame:
+    """Executes SQL -> DataFrame, applies mapping (and File Name derivation) in-memory, no GCS write."""
+    from google.auth import default as gauth_default
+    creds, project_id = gauth_default()
+    sm = get_db_credentials(project_id, creds, db_cfg["secrets"])
+
+    conn = get_db_connection_with_gcs_certs(
+        dbname=db_cfg["dbname"],
+        user=sm["user"],
+        password=sm["password"],
+        host=sm["host"],
+        port=int(db_cfg.get("port", 5432)),
+        bucket_name=gcs_cfg.get("bucket_name"),
+        client_cert_gcs=gcs_cfg.get("client_cert"),
+        client_key_gcs=gcs_cfg.get("client_key"),
+        server_ca_gcs=gcs_cfg.get("server_ca"),
+    )
+    try:
+        df_src = pd.read_sql_query(sql, con=conn)
+    finally:
+        conn.close()
+
+    return _apply_transformations(df_src, mapping)
+
+
+*************************************
+
+def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
+    cfg = load_config(config_path)
+
+    db_cfg  = cfg["db"]
+    gcs_cfg = cfg.get("gcs", {})
+    mapping_q1 = cfg.get("mapping", MAPPING)
+    mapping_q2 = cfg.get("mapping_q2", {})  # usually empty for codes table
+
+    outs = cfg.get("outputs", {}) or {}
+    out_cfg_q1          = outs.get("q1", {})            # optional
+    out_cfg_q2          = outs.get("q2", {})            # optional
+    out_cfg_q1_enriched = outs.get("q1_enriched", {})   # recommended
+
+    # -------- 1) Run both queries INTO MEMORY (no writes yet) --------
+    df1 = run_query_to_df(sql=cfg["sql_query1"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q1)
+    df2 = run_query_to_df(sql=cfg["sql_query2"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q2)
+
+    # -------- 2) Build code -> description map and enrich df1 --------
+    codes_to_desc = _codes_to_descriptions_builder(df2)
+    df1_enriched = df1.copy()
+    if "Error Code" in df1_enriched.columns:
+        df1_enriched["Error Descriptions"] = df1_enriched["Error Code"].apply(codes_to_desc)
+    else:
+        logging.warning("Column 'Error Code' not found in Q1 output; skipping enrichment.")
+        df1_enriched["Error Descriptions"] = ""
+
+    # -------- 3) Write only what you want --------
+    uris = {}
+
+    # (optional) write raw Q1
+    if out_cfg_q1:
+        uris["q1_uri"] = write_df_to_gcs(
+            df1,
+            gs_uri=out_cfg_q1.get("gs_uri"),
+            bucket=out_cfg_q1.get("bucket"),
+            object_name=out_cfg_q1.get("object_name"),
+            fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
+            sheet_name=out_cfg_q1.get("sheet_name", "Query1"),
+            auto_increment=out_cfg_q1.get("auto_increment", True),
+        )
+
+    # (optional) write Q2 reference table
+    if out_cfg_q2:
+        uris["q2_uri"] = write_df_to_gcs(
+            df2,
+            gs_uri=out_cfg_q2.get("gs_uri"),
+            bucket=out_cfg_q2.get("bucket"),
+            object_name=out_cfg_q2.get("object_name"),
+            fmt=out_cfg_q2.get("fmt", DEFAULT_OUTPUT_FMT),
+            sheet_name=out_cfg_q2.get("sheet_name", "Query2"),
+            auto_increment=out_cfg_q2.get("auto_increment", True),
+        )
+
+    # (recommended) write enriched Q1
+    if out_cfg_q1_enriched:
+        uris["q1_enriched_uri"] = write_df_to_gcs(
+            df1_enriched,
+            gs_uri=out_cfg_q1_enriched.get("gs_uri"),
+            bucket=out_cfg_q1_enriched.get("bucket"),
+            object_name=out_cfg_q1_enriched.get("object_name"),
+            fmt=out_cfg_q1_enriched.get("fmt", DEFAULT_OUTPUT_FMT),
+            sheet_name=out_cfg_q1_enriched.get("sheet_name", "Query1_Enriched"),
+            auto_increment=out_cfg_q1_enriched.get("auto_increment", True),
+        )
+    else:
+        # If no explicit target for enriched, but q1 destination exists, mirror it with `_enriched`
+        if out_cfg_q1.get("gs_uri"):
+            bkt, obj = _parse_gs_uri(out_cfg_q1["gs_uri"])
+            uris["q1_enriched_uri"] = write_df_to_gcs(
+                df1_enriched,
+                bucket=bkt,
+                object_name=_suffix_path(obj, "_enriched"),
+                fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
+                sheet_name="Query1_Enriched",
+                auto_increment=True,
+            )
+        elif out_cfg_q1.get("bucket") and out_cfg_q1.get("object_name"):
+            uris["q1_enriched_uri"] = write_df_to_gcs(
+                df1_enriched,
+                bucket=out_cfg_q1["bucket"],
+                object_name=_suffix_path(out_cfg_q1["object_name"], "_enriched"),
+                fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
+                sheet_name="Query1_Enriched",
+                auto_increment=True,
+            )
+        else:
+            # no destination provided at all; keep in-memory only
+            logging.info("No outputs.q1_enriched and no outputs.q1 destination; enriched result kept in-memory only.")
+
+    return uris, df1_enriched  # return URIs (if any) AND the enriched DataFrame for further use
+
+***********************************************************************************
 import pandas as pd
 from collections import OrderedDict
 
