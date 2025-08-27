@@ -1,3 +1,103 @@
+{
+  "database": { "...": "..." },
+  "gcs": { "...": "..." },
+  "sql_query1": "SELECT ...",
+  "sql_query2": "SELECT ...",
+  "mapping": {
+    "roster_id": "Roster ID",
+    "state": "state",
+    "business_owner": "Medicare_Commercial",
+    "group_type": "Group Team",
+    "roster_name": "Provider Entity",
+    "parent_transaction_type": "Parent Transaction Type",
+    "case_number": "Case Number",
+    "transaction_type": "Transaction Type",
+    "input_rec_count": "Total Number Of Rows",
+    "total_rows_with_errors": "Total Rows With Errors",
+    "file_path": "File Name",
+    "critical_error_codes": "Error Code",
+    "complexity": "complexity",
+    "received_date": "received_date",
+    "version_number": "version_number",
+    "version_status": "version_status",
+    "status": "status"
+  },
+  "outputs": {
+    "q1_enriched": {
+      "gs_uri": "gs://your-bucket/report/prvrostercnf_file_stats_enriched_{today_str}.xlsx",
+      "fmt": "xlsx",
+      "sheet": "EnrichedData",
+      "auto_increment": true
+    }
+  }
+}
+
+******************************8
+def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
+    cfg = load_config(config_path)
+
+    db_cfg   = cfg["database"]
+    gcs_cfg  = cfg.get("gcs", {})
+    # mapping for Q1 (main table)
+    mapping_q1 = cfg.get("mapping", MAPPING)
+    # mapping for Q2 (codes table) typically empty
+    mapping_q2 = cfg.get("mapping_q2", {})
+
+    outs                = cfg.get("outputs", {}) or {}
+    out_cfg_q1_enriched = outs.get("q1_enriched", {})  # <-- only one we’ll write
+
+    # ---------- 1) Pull both queries into memory ----------
+    df1 = run_query_to_df(sql=cfg["sql_query1"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q1)
+    df2 = run_query_to_df(sql=cfg["sql_query2"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q2)
+
+    # ---------- 2) Build code -> description map and enrich df1 ----------
+    codes_to_desc = _codes_to_descriptions_builder(df2)  # your existing helper
+    df1_enriched  = df1.copy()
+    if "Error Code" in df1_enriched.columns:
+        df1_enriched["Error Descriptions"] = df1_enriched["Error Code"].apply(codes_to_desc)
+    else:
+        logging.warning("Column 'Error Code' not found in Q1 output; skipping enrichment.")
+        df1_enriched["Error Descriptions"] = ""
+
+    # ---------- 3) Select ONLY mapped columns (+ Error Descriptions) ----------
+    # keep_unmapped=False makes it 'select-only'
+    df1_enriched = _apply_transformations(
+        df1_enriched,
+        mapping_q1,
+        keep_unmapped=False,
+        extra_output_cols=["Error Descriptions"]  # append enrichment column
+    )
+
+    # ---------- 4) Write ONLY the enriched output ----------
+    if not out_cfg_q1_enriched:
+        # If config didn’t specify, mirror q1 target name with "_enriched"
+        out_cfg_q1 = outs.get("q1", {})
+        if out_cfg_q1 and out_cfg_q1.get("gs_uri"):
+            bkt, obj = _parse_gs_uri(out_cfg_q1["gs_uri"])
+            obj_enriched = re.sub(r"(\.xlsx|\.csv)$", r"_enriched\1", obj)
+            gs_uri = f"gs://{bkt}/{obj_enriched}"
+        elif out_cfg_q1 and out_cfg_q1.get("bucket") and out_cfg_q1.get("object_name"):
+            bkt = out_cfg_q1["bucket"]
+            obj = out_cfg_q1["object_name"]
+            obj_enriched = re.sub(r"(\.xlsx|\.csv)$", r"_enriched\1", obj)
+            gs_uri = f"gs://{bkt}/{obj_enriched}"
+        else:
+            raise ValueError("No outputs.q1_enriched and no base outputs.q1 to mirror.")
+        out_cfg_q1_enriched = {"gs_uri": gs_uri, "fmt": DEFAULT_OUTPUT_FMT, "sheet": "Query1_Enriched", "auto_increment": True}
+
+    enriched_uri = write_df_to_gcs(
+        df1_enriched,
+        gs_uri=out_cfg_q1_enriched.get("gs_uri"),
+        bucket=out_cfg_q1_enriched.get("bucket"),
+        object_name=out_cfg_q1_enriched.get("object_name"),
+        fmt=out_cfg_q1_enriched.get("fmt", DEFAULT_OUTPUT_FMT),
+        sheet_name=out_cfg_q1_enriched.get("sheet", "Query1_Enriched"),
+        auto_increment=out_cfg_q1_enriched.get("auto_increment", True),
+    )
+
+    return {"q1_enriched_uri": enriched_uri}
+
+**********************************
 def strip_tz_from_datetime(df: pd.DataFrame) -> pd.DataFrame:
     """Return a copy of df with all timezone-aware datetimes converted to tz-naive."""
     out = df.copy()
