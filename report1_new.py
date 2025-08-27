@@ -1,6 +1,4 @@
-# run_two_queries_to_gcs.py  (with error-code enrichment)
 from __future__ import annotations
-
 import io
 import json
 import logging
@@ -10,25 +8,19 @@ from typing import Dict, Optional, Tuple, Union
 
 import pandas as pd
 import psycopg2
-
 from google.cloud import storage
 from google.cloud import secretmanager
 from google.auth import default as gauth_default
 from collections import OrderedDict
 
-# -------------------------- logging & defaults --------------------------
-
 LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR
 logging.basicConfig(level=getattr(logging, LOG_LEVEL), format="%(levelname)s %(message)s")
-
-CONFIG_PATH = "gs://YOUR_BUCKET/dags/pdi-ingestion-gcp/Dev/config/db_config.json"
-
-DEFAULT_OUTPUT_FMT   = "xlsx"
+CONFIG_PATH = "gs://us-east4-cmp-dev-pdi-ink-05-5e6953c0-bucket/dags/pdi-ingestion-gcp/Dev/config/db_config1.json"
+DEFAULT_OUTPUT_FMT = "xlsx"
 DEFAULT_OUTPUT_SHEET = "Sheet1"
 
-# -------------------------- helpers --------------------------
-
-def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
+# --- helpers ---
+def parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
     if not gs_uri.startswith("gs://"):
         raise ValueError("gs_uri must start with gs://")
     bucket, _, obj = gs_uri[5:].partition("/")
@@ -36,35 +28,36 @@ def _parse_gs_uri(gs_uri: str) -> Tuple[str, str]:
         raise ValueError("Invalid gs:// URI")
     return bucket, obj
 
-def _next_available_name(client: storage.Client, bucket: str, obj: str) -> str:
-    m = re.match(r"^(.*?)(\.[^./\\]+)?$", obj)
+def next_available_name(client: storage.Client, bucket: str, obj: str) -> str:
+    m = re.match(r"^(.*?)(\.[^.]*)?$", obj)
     stem, ext = (m.group(1), m.group(2) or "")
     i = 1
     b = client.bucket(bucket)
-    while b.blob(obj).exists(client):
+    while b.blob(obj).exists():
         obj = f"{stem}_{i:03d}{ext}"
         i += 1
     return obj
 
-def _suffix_path(obj: str, suffix: str) -> str:
+def suffix_path(obj: str, suffix: str) -> str:
     """Insert suffix before extension: a/b/c.xlsx -> a/b/c_suffix.xlsx"""
-    m = re.match(r"^(.*?)(\.[^./\\]+)?$", obj)
+    m = re.match(r"^(.*?)(\.[^.]*)?$", obj)
     stem, ext = (m.group(1), m.group(2) or "")
-    return f"{stem}{suffix}{ext or ''}"
+    return f"{stem}{suffix}{ext}"
 
-# -------------------------- config & secrets --------------------------
-
+# --- config & secrets ---
 def load_config(ref: Union[str, Path] = CONFIG_PATH) -> dict:
     ref = str(ref)
     if ref.startswith("gs://"):
-        bucket_name, blob_path = _parse_gs_uri(ref)
+        bucket_name, blob_path = ref[5:].split("/", 1)
         client = storage.Client()
-        txt = client.bucket(bucket_name).blob(blob_path).download_as_text()
-        return json.loads(txt)
-    with open(ref, "r") as f:
-        return json.load(f)
+        bucket = client.bucket(bucket_name)
+        text = bucket.blob(blob_path).download_as_text()
+        return json.loads(text)
+    else:
+        with open(ref, "r") as f:
+            return json.load(f)
 
-def _secret_fullname(project_id: str, secret_name_or_full: str, version: str) -> str:
+def __secret_fullname(project_id: str, secret_name_or_full: str, version: str) -> str:
     if "/secrets/" in secret_name_or_full:
         if "/versions/" in secret_name_or_full:
             return secret_name_or_full
@@ -73,20 +66,19 @@ def _secret_fullname(project_id: str, secret_name_or_full: str, version: str) ->
 
 def get_secret_value(project_id: str, secret_name: str, creds, version: str = "latest") -> str:
     client = secretmanager.SecretManagerServiceClient(credentials=creds)
-    name = _secret_fullname(project_id, secret_name, version)
-    logging.info("Fetching secret: %s", name)
+    name = f"projects/{project_id}/secrets/{secret_name}/versions/{version}"
+    logging.info("Fetching secret: %s", secret_name)
     resp = client.access_secret_version(name=name)
     return resp.payload.data.decode("utf-8")
 
-def get_db_credentials(project_id: str, creds, secrets_cfg: dict) -> dict:
+def get_db_credentials(project_id: str, creds, secret_config: dict) -> dict:
     return {
-        "user":     get_secret_value(project_id, secrets_cfg["user"], creds),
-        "password": get_secret_value(project_id, secrets_cfg["password"], creds),
-        "host":     get_secret_value(project_id, secrets_cfg["host"], creds),
+        "user": get_secret_value(project_id, secret_config["user"], creds),
+        "password": get_secret_value(project_id, secret_config["password"], creds),
+        "host": get_secret_value(project_id, secret_config["host"], creds),
     }
 
-# -------------------------- DB connection --------------------------
-
+# --- DB connection ---
 def get_db_connection_with_gcs_certs(
     dbname: str,
     user: str,
@@ -97,12 +89,20 @@ def get_db_connection_with_gcs_certs(
     client_cert_gcs: Optional[str] = None,
     client_key_gcs: Optional[str] = None,
     server_ca_gcs: Optional[str] = None,
+    creds=None,
+    project_id: Optional[str] = None
 ):
-    # Minimal (non-SSL). Extend if you need SSL certs from GCS.
-    return psycopg2.connect(dbname=dbname, user=user, password=password, host=host, port=port)
+    """Minimal connection (no SSL certs used here)."""
+    conn = psycopg2.connect(
+        dbname=dbname,
+        user=user,
+        password=password,
+        host=host,
+        port=port,
+    )
+    return conn
 
-# -------------------------- transformations --------------------------
-
+# --- transformations ---
 MAPPING: Dict[str, str] = {
     "business_owner": "Medicare_Commercial",
     "group_type": "Group Team",
@@ -128,11 +128,9 @@ def _apply_transformations(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.Data
     df = df[ordered]
     return df
 
-# -------------------------- GCS writers --------------------------
-
 def _autosize_and_freeze_openpyxl(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str = DEFAULT_OUTPUT_SHEET):
     from openpyxl.utils import get_column_letter
-    ws = writer.book[sheet_name]
+    ws = writer.sheets[sheet_name]
     ws.freeze_panes = "A2"
     for idx, col in enumerate(df.columns, 1):
         try:
@@ -153,14 +151,14 @@ def write_df_to_gcs(
 ) -> str:
     client = storage.Client()
     if gs_uri:
-        bucket_name, obj_name = _parse_gs_uri(gs_uri)
+        bucket_name, obj_name = parse_gs_uri(gs_uri)
     else:
         if not bucket or not object_name:
             raise ValueError("Provide either gs_uri OR (bucket AND object_name).")
         bucket_name, obj_name = bucket, object_name
 
     if auto_increment:
-        obj_name = _next_available_name(client, bucket_name, obj_name)
+        obj_name = next_available_name(client, bucket_name, obj_name)
 
     blob = client.bucket(bucket_name).blob(obj_name)
     fmt = fmt.lower()
@@ -185,22 +183,9 @@ def write_df_to_gcs(
     logging.info("[OUT %s -> %s]", fmt.upper(), out_uri)
     return out_uri
 
-# -------------------------- core runner --------------------------
-
-def run_pipeline_from_db(
-    *,
-    sql: str,
-    db_cfg: dict,
-    gcs_cfg: dict,
-    out_gs_uri: Optional[str] = None,
-    out_bucket: Optional[str] = None,
-    out_object_name: Optional[str] = None,
-    out_fmt: str = DEFAULT_OUTPUT_FMT,
-    out_sheet_name: str = DEFAULT_OUTPUT_SHEET,
-    out_auto_increment: bool = True,
-    mapping: Dict[str, str] = MAPPING,
-) -> Tuple[pd.DataFrame, str]:
-    logging.info("Connecting to Cloud SQL and running query...")
+# --- core runner ---
+def run_query_to_df(*, sql: str, db_cfg: dict, gcs_cfg: dict, mapping: Dict[str, str]) -> pd.DataFrame:
+    """Executes SQL -> DataFrame, applies mapping (and File Name derivation) in-memory, no GCS write."""
     creds, project_id = gauth_default()
     sm = get_db_credentials(project_id, creds, db_cfg["secrets"])
 
@@ -214,28 +199,15 @@ def run_pipeline_from_db(
         client_cert_gcs=gcs_cfg.get("client_cert"),
         client_key_gcs=gcs_cfg.get("client_key"),
         server_ca_gcs=gcs_cfg.get("server_ca"),
+        creds=creds,
+        project_id=project_id
     )
-
     try:
         df_src = pd.read_sql_query(sql, con=conn)
-        logging.info("Query returned rows=%d cols=%d", len(df_src), len(df_src.columns))
     finally:
         conn.close()
 
-    df_out = _apply_transformations(df_src, mapping)
-
-    written_uri = write_df_to_gcs(
-        df_out,
-        gs_uri=out_gs_uri,
-        bucket=out_bucket,
-        object_name=out_object_name,
-        fmt=out_fmt,
-        sheet_name=out_sheet_name,
-        auto_increment=out_auto_increment,
-    )
-    return df_out, written_uri
-
-# -------------------------- enrichment (Q1 + Q2) --------------------------
+    return _apply_transformations(df_src, mapping)
 
 def _codes_to_descriptions_builder(error_codes_df: pd.DataFrame):
     """Return a function codes_str -> 'desc1, desc2' using codes map from df."""
@@ -253,52 +225,24 @@ def _codes_to_descriptions_builder(error_codes_df: pd.DataFrame):
 
     return codes_to_descriptions
 
-# -------------------------- multi-query coordinator --------------------------
-
 def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
     cfg = load_config(config_path)
 
-    db_cfg  = cfg["db"]
+    db_cfg = cfg["database"]
     gcs_cfg = cfg.get("gcs", {})
-    mapping = cfg.get("mapping", MAPPING)
+    mapping_q1 = cfg.get("mapping", MAPPING)
+    mapping_q2 = cfg.get("mapping_q2", {})  # usually empty for codes table
 
     outs = cfg.get("outputs", {}) or {}
-    out_cfg_q1 = outs.get("q1", {})
-    out_cfg_q2 = outs.get("q2", {})
-    out_cfg_q1_enriched = outs.get("q1_enriched", {})  # optional
+    out_cfg_q1 = outs.get("q1", {})  # optional
+    out_cfg_q2 = outs.get("q2", {})  # optional
+    out_cfg_q1_enriched = outs.get("q1_enriched", {})  # recommended
 
-    # -------- Query 1 (roster/stat rows) --------
-    df1, uri1 = run_pipeline_from_db(
-        sql=cfg["sql_query1"],
-        db_cfg=db_cfg,
-        gcs_cfg=gcs_cfg,
-        out_gs_uri=out_cfg_q1.get("gs_uri"),
-        out_bucket=out_cfg_q1.get("bucket"),
-        out_object_name=out_cfg_q1.get("object_name"),
-        out_fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
-        out_sheet_name=out_cfg_q1.get("sheet_name", "Query1"),
-        out_auto_increment=out_cfg_q1.get("auto_increment", True),
-        mapping=mapping,
-    )
-    logging.info("Q1 written to %s", uri1)
+    # --- 1) Run both queries INTO MEMORY (no writes yet) ---
+    df1 = run_query_to_df(sql=cfg["sql_query1"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q1)
+    df2 = run_query_to_df(sql=cfg["sql_query2"], db_cfg=db_cfg, gcs_cfg=gcs_cfg, mapping=mapping_q2)
 
-    # -------- Query 2 (error code reference) --------
-    df2, uri2 = run_pipeline_from_db(
-        sql=cfg["sql_query2"],
-        db_cfg=db_cfg,
-        gcs_cfg=gcs_cfg,
-        out_gs_uri=out_cfg_q2.get("gs_uri"),
-        out_bucket=out_cfg_q2.get("bucket"),
-        out_object_name=out_cfg_q2.get("object_name"),
-        out_fmt=out_cfg_q2.get("fmt", DEFAULT_OUTPUT_FMT),
-        out_sheet_name=out_cfg_q2.get("sheet_name", "Query2"),
-        out_auto_increment=out_cfg_q2.get("auto_increment", True),
-        mapping=cfg.get("mapping_q2", {}),  # usually no renames needed for codes table
-    )
-    logging.info("Q2 written to %s", uri2)
-
-    # -------- Enrich Q1 with "Error Descriptions" using Q2 --------
-    # Build converter and add the new column on a copy of df1
+    # --- 2) Build code -> description map and enrich df1 ---
     codes_to_desc = _codes_to_descriptions_builder(df2)
     df1_enriched = df1.copy()
     if "Error Code" in df1_enriched.columns:
@@ -307,9 +251,36 @@ def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
         logging.warning("Column 'Error Code' not found in Q1 output; skipping enrichment.")
         df1_enriched["Error Descriptions"] = ""
 
-    # Destination for enriched file:
+    # --- 3) Write only what you want ---
+    uris = {}
+    
+    # (optional) write raw Q1
+    if out_cfg_q1:
+        uris["q1_uri"] = write_df_to_gcs(
+            df1,
+            gs_uri=out_cfg_q1.get("gs_uri"),
+            bucket=out_cfg_q1.get("bucket"),
+            object_name=out_cfg_q1.get("object_name"),
+            fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
+            sheet_name=out_cfg_q1.get("sheet_name", "Query1"),
+            auto_increment=out_cfg_q1.get("auto_increment", True),
+        )
+
+    # (optional) write Q2 reference table
+    if out_cfg_q2:
+        uris["q2_uri"] = write_df_to_gcs(
+            df2,
+            gs_uri=out_cfg_q2.get("gs_uri"),
+            bucket=out_cfg_q2.get("bucket"),
+            object_name=out_cfg_q2.get("object_name"),
+            fmt=out_cfg_q2.get("fmt", DEFAULT_OUTPUT_FMT),
+            sheet_name=out_cfg_q2.get("sheet_name", "Query2"),
+            auto_increment=out_cfg_q2.get("auto_increment", True),
+        )
+
+    # (recommended) write enriched Q1
     if out_cfg_q1_enriched:
-        enriched_uri = write_df_to_gcs(
+        uris["q1_enriched_uri"] = write_df_to_gcs(
             df1_enriched,
             gs_uri=out_cfg_q1_enriched.get("gs_uri"),
             bucket=out_cfg_q1_enriched.get("bucket"),
@@ -319,78 +290,33 @@ def run_both_queries_from_config(config_path: Union[str, Path] = CONFIG_PATH):
             auto_increment=out_cfg_q1_enriched.get("auto_increment", True),
         )
     else:
-        # If no explicit target given, mirror q1’s target and add “_enriched”
-        if out_cfg_q1.get("gs_uri"):
-            bkt, obj = _parse_gs_uri(out_cfg_q1["gs_uri"])
-            enriched_uri = write_df_to_gcs(
+        # If no explicit target for enriched, but q1 destination exists, mirror it with `enriched`
+        if out_cfg_q1 and out_cfg_q1.get("gs_uri"):
+            bkt, obj = parse_gs_uri(out_cfg_q1["gs_uri"])
+            uris["q1_enriched_uri"] = write_df_to_gcs(
                 df1_enriched,
                 bucket=bkt,
-                object_name=_suffix_path(obj, "_enriched"),
+                object_name=suffix_path(obj, "_enriched"),
+                fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
+                sheet_name="Query1_Enriched",
+                auto_increment=True,
+            )
+        elif out_cfg_q1 and out_cfg_q1.get("bucket") and out_cfg_q1.get("object_name"):
+            uris["q1_enriched_uri"] = write_df_to_gcs(
+                df1_enriched,
+                bucket=out_cfg_q1["bucket"],
+                object_name=suffix_path(out_cfg_q1["object_name"], "_enriched"),
                 fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
                 sheet_name="Query1_Enriched",
                 auto_increment=True,
             )
         else:
-            # If q1 used (bucket, object_name), reuse them
-            bkt = out_cfg_q1.get("bucket")
-            obj = out_cfg_q1.get("object_name")
-            if not (bkt and obj):
-                raise ValueError(
-                    "Provide outputs.q1 or outputs.q1_enriched destination in config."
-                )
-            enriched_uri = write_df_to_gcs(
-                df1_enriched,
-                bucket=bkt,
-                object_name=_suffix_path(obj, "_enriched"),
-                fmt=out_cfg_q1.get("fmt", DEFAULT_OUTPUT_FMT),
-                sheet_name="Query1_Enriched",
-                auto_increment=True,
-            )
+            # no destination provided at all; help in-memory only.
+            logging.info("No outputs.q1_enriched and no outputs.q1 destination; enriched result kept in-memory only.")
 
-    logging.info("Q1 (enriched) written to %s", enriched_uri)
+    return uris
 
-    return {"q1_uri": uri1, "q2_uri": uri2, "q1_enriched_uri": enriched_uri}
-
-# -------------------------- optional: single Excel with two sheets --------------------------
-
-def write_two_sheets_one_file(
-    df1: pd.DataFrame,
-    df2: pd.DataFrame,
-    *,
-    sheet1: str = "Query1",
-    sheet2: str = "Query2",
-    gs_uri: Optional[str] = None,
-    bucket: Optional[str] = None,
-    object_name: Optional[str] = None,
-    auto_increment: bool = True,
-) -> str:
-    client = storage.Client()
-    if gs_uri:
-        bucket_name, obj_name = _parse_gs_uri(gs_uri)
-    else:
-        if not bucket or not object_name:
-            raise ValueError("Provide either gs_uri OR (bucket AND object_name).")
-        bucket_name, obj_name = bucket, object_name
-    if auto_increment:
-        obj_name = _next_available_name(client, bucket_name, obj_name)
-
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df1.to_excel(writer, index=False, sheet_name=sheet1)
-        _autosize_and_freeze_openpyxl(writer, df1, sheet1)
-        df2.to_excel(writer, index=False, sheet_name=sheet2)
-        _autosize_and_freeze_openpyxl(writer, df2, sheet2)
-    bio.seek(0)
-    storage.Client().bucket(bucket_name).blob(obj_name).upload_from_file(
-        bio,
-        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    out_uri = f"gs://{bucket_name}/{obj_name}"
-    logging.info("[OUT XLSX -> %s]", out_uri)
-    return out_uri
-
-# -------------------------- main --------------------------
-
+# --- main ---
 if __name__ == "__main__":
     uris = run_both_queries_from_config(CONFIG_PATH)
     print(uris)
