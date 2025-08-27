@@ -1,3 +1,21 @@
+def strip_tz_from_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df with all timezone-aware datetimes converted to tz-naive."""
+    out = df.copy()
+
+    # 1) Handle datetime64[ns, tz] dtypes
+    for col in out.select_dtypes(include=["datetimetz"]).columns:
+        out[col] = out[col].dt.tz_convert("UTC").dt.tz_localize(None)
+
+    # 2) Handle object columns that may contain tz-aware datetime objects
+    for col in out.columns[out.dtypes.eq("object")]:
+        mask = out[col].map(lambda x: getattr(getattr(x, "tzinfo", None), "utcoffset", None) is not None)
+        if mask.any():
+            tmp = pd.to_datetime(out.loc[mask, col], errors="coerce", utc=True)
+            out.loc[mask, col] = tmp.dt.tz_localize(None)
+
+    return out
+
+*********************
 from __future__ import annotations
 import io
 import json
