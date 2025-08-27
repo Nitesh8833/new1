@@ -1,0 +1,26 @@
+# Expand roster_df Error Code column and join with error_codes_df
+
+# Step 1: Split comma-separated error codes into lists
+roster_expanded = (
+    roster_df
+    .assign(Error_Code=roster_df["Error Code"].str.split(",\s*"))
+    .explode("Error_Code")
+)
+
+# Step 2: Clean whitespaces from error codes
+roster_expanded["Error_Code"] = roster_expanded["Error_Code"].str.strip()
+
+# Step 3: Join with error_codes_df to bring error descriptions
+final_df = roster_expanded.merge(
+    error_codes_df,
+    left_on="Error_Code",
+    right_on="error_code",
+    how="left"
+)
+
+# Step 4: Save to Excel for user to download
+sample_file = "/mnt/data/sample_roster_with_error_details.xlsx"
+final_df.to_excel(sample_file, index=False)
+
+# Show first few rows of combined dataframe for preview
+final_df.head(), sample_file
