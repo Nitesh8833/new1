@@ -1,6 +1,38 @@
 import pandas as pd
 from collections import OrderedDict
 
+# Load the two files (if not already loaded)
+roster_df = pd.read_excel("/mnt/data/roster_data.xlsx")
+error_codes_df = pd.read_excel("/mnt/data/error_codes.xlsx")
+
+# Build mapping dictionary: error_code -> description
+code_to_desc = error_codes_df.set_index("error_code")["description"].to_dict()
+
+def codes_to_descriptions(codes_str: str) -> str:
+    """Convert 'E002, E010, ...' into 'Missing NPI TYPE 1, Missing PROVIDER EFFECTIVE DATE, ...'"""
+    if pd.isna(codes_str) or not str(codes_str).strip():
+        return ""
+    seen = OrderedDict()
+    for raw in str(codes_str).split(","):
+        code = raw.strip()
+        if code and code in code_to_desc:
+            seen[code_to_desc[code]] = None  # ordered set
+    return ", ".join(seen.keys())
+
+# Add only description column
+final_df = roster_df.copy()
+final_df["Error Descriptions"] = final_df["Error Code"].apply(codes_to_descriptions)
+
+# Save result
+output_file = "/mnt/data/final_roster_with_descriptions.xlsx"
+final_df.to_excel(output_file, index=False)
+
+print("Saved file:", output_file)
+
+*****************************************************************
+import pandas as pd
+from collections import OrderedDict
+
 # Assume roster_df and error_codes_df already loaded from earlier
 # If not, uncomment the next two lines:
 # roster_df = pd.read_excel("/mnt/data/roster_data.xlsx")
