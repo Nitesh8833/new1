@@ -1,4 +1,46 @@
+import io
+import pandas as pd
+from google.cloud import storage
 
+# Always present in your result:
+uri = result["q1_enriched_uri"]     # e.g., gs://bucket/path/file_enriched.xlsx
+print("Result keys:", list(result.keys()))
+print("URI type:", type(uri))
+
+if SEND_EMAIL:
+    # 1) Prefer the in-memory DF if your function ever returns it
+    df = result.get("q1_enriched")
+    if not isinstance(df, pd.DataFrame):
+        # 2) Fallback: load from GCS URI you just wrote
+        if uri.lower().endswith(".xlsx"):
+            # no gcsfs needed; use Storage client
+            client = storage.Client()
+            bucket_name, blob_name = uri.removeprefix("gs://").split("/", 1)
+            blob = client.bucket(bucket_name).blob(blob_name)
+            xlsx_bytes = blob.download_as_bytes()
+            df = pd.read_excel(io.BytesIO(xlsx_bytes), engine="openpyxl")
+        else:
+            # if you ever write CSV instead of XLSX and have gcsfs installed,
+            # pandas can read the gs:// path directly
+            df = pd.read_csv(uri)
+
+    # Safety check
+    assert isinstance(df, pd.DataFrame), f"Expected DataFrame, got {type(df)}"
+
+    # 3) Build CSV and send
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    text = EMAIL_TEXT + f"\n\nRows: {len(df)} | Columns: {df.shape[1]}"
+    ok = send_email_alert(
+        recipient=EMAIL_TO,
+        subject=EMAIL_SUBJECT,
+        message_body=text,
+        html_content=EMAIL_HTML,
+        attachments=[(csv_bytes, "Matrix_report.csv", "text/csv")],
+    )
+    if not ok:
+        logging.error("Email send failed")
+    
+***********************
 import os
 import pandas as pd
 
